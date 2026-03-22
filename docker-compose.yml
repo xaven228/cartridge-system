@@ -1,0 +1,46 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: cartridge_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-cartridge_db}
+      POSTGRES_USER: ${POSTGRES_USER:-cartridge_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-cartridge_pass}
+    ports:
+      - "${POSTGRES_HOST_PORT:-5433}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-cartridge_user} -d ${POSTGRES_DB:-cartridge_db}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: cartridge_backend
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/${POSTGRES_DB:-cartridge_db}
+      SPRING_DATASOURCE_USERNAME: ${POSTGRES_USER:-cartridge_user}
+      SPRING_DATASOURCE_PASSWORD: ${POSTGRES_PASSWORD:-cartridge_pass}
+      SERVER_PORT: 8080
+    ports:
+      - "${APP_PORT:-8080}:8080"
+
+networks:
+  default:
+    name: cartridge_net
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.31.250.0/24
+
+volumes:
+  postgres_data:
