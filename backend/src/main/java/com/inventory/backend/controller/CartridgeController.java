@@ -3,8 +3,12 @@ package com.inventory.backend.controller;
 import com.inventory.backend.dto.AdjustQuantityRequest;
 import com.inventory.backend.dto.CartridgeResponse;
 import com.inventory.backend.dto.CreateCartridgeRequest;
+import com.inventory.backend.dto.InstallCartridgeRequest;
+import com.inventory.backend.dto.ReplaceCartridgeRequest;
 import com.inventory.backend.dto.ReturnFromRefillRequest;
+import com.inventory.backend.dto.RemoveCartridgeInstallationRequest;
 import com.inventory.backend.dto.SendToRefillRequest;
+import com.inventory.backend.dto.UpdateCartridgeRefillableRequest;
 import com.inventory.backend.entity.CartridgeStatus;
 import com.inventory.backend.service.CartridgeService;
 import jakarta.validation.Valid;
@@ -64,6 +68,38 @@ public class CartridgeController {
         return cartridgeService.returnFromRefill(id, request);
     }
 
+    @PostMapping("/{id}/install")
+    public CartridgeResponse installToPrinter(
+            @PathVariable Long id,
+            @Valid @RequestBody InstallCartridgeRequest request
+    ) {
+        return cartridgeService.installToPrinter(id, request);
+    }
+
+    @PostMapping("/{id}/replace")
+    public CartridgeResponse replaceInPrinter(
+            @PathVariable Long id,
+            @Valid @RequestBody ReplaceCartridgeRequest request
+    ) {
+        return cartridgeService.replaceInPrinter(id, request);
+    }
+
+    @PostMapping("/{id}/remove-installation")
+    public CartridgeResponse removeFromPrinter(
+            @PathVariable Long id,
+            @Valid @RequestBody RemoveCartridgeInstallationRequest request
+    ) {
+        return cartridgeService.removeFromPrinter(id, request);
+    }
+
+    @PatchMapping("/{id}/refillable")
+    public CartridgeResponse updateRefillable(
+            @PathVariable Long id,
+            @Valid @RequestBody UpdateCartridgeRefillableRequest request
+    ) {
+        return cartridgeService.updateRefillable(id, request);
+    }
+
     @PostMapping("/{id}/write-off")
     public CartridgeResponse writeOff(
             @PathVariable Long id,
@@ -71,5 +107,10 @@ public class CartridgeController {
     ) {
         String comment = body != null ? body.get("comment") : null;
         return cartridgeService.writeOff(id, comment);
+    }
+
+    @DeleteMapping("/{id}")
+    public void delete(@PathVariable Long id) {
+        cartridgeService.delete(id);
     }
 }

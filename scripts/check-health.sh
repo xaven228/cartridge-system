@@ -10,6 +10,7 @@ fi
 
 APP_PORT="${APP_PORT:-8080}"
 POSTGRES_HOST_PORT="${POSTGRES_HOST_PORT:-5433}"
+FRONTEND_PORT="${FRONTEND_PORT:-3000}"
 
 echo "== Cartridge System Health Check =="
 
@@ -25,7 +26,17 @@ else
 fi
 
 echo
-echo "[2] API check"
+echo "[2] Frontend check"
+FRONT_HTTP_CODE="$(curl -s -o /tmp/cartridge_front_body.html -w '%{http_code}' "http://localhost:${FRONTEND_PORT}" || true)"
+if [[ "$FRONT_HTTP_CODE" == "200" ]]; then
+  echo "  OK: frontend responds on port $FRONTEND_PORT (HTTP 200)"
+else
+  echo "  FAIL: frontend check on port $FRONTEND_PORT returned HTTP $FRONT_HTTP_CODE"
+  STATUS=1
+fi
+
+echo
+echo "[3] API check"
 HTTP_CODE="$(curl -s -o /tmp/cartridge_api_body.json -w '%{http_code}' "http://localhost:${APP_PORT}/api/departments" || true)"
 if [[ "$HTTP_CODE" == "200" ]]; then
   echo "  OK: API responds on port $APP_PORT (HTTP 200)"
@@ -35,7 +46,14 @@ else
 fi
 
 echo
-echo "[3] TCP ports"
+echo "[4] TCP ports"
+if ss -ltn | grep -q ":${FRONTEND_PORT} "; then
+  echo "  OK: frontend port ${FRONTEND_PORT} is listening"
+else
+  echo "  FAIL: frontend port ${FRONTEND_PORT} is not listening"
+  STATUS=1
+fi
+
 if ss -ltn | grep -q ":${APP_PORT} "; then
   echo "  OK: app port ${APP_PORT} is listening"
 else
@@ -51,7 +69,7 @@ else
 fi
 
 echo
-echo "[4] Disk usage"
+echo "[5] Disk usage"
 df -h "$ROOT_DIR" | sed 's/^/  /'
 
 if [[ "$STATUS" -eq 0 ]]; then

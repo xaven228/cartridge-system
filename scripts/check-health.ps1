@@ -14,6 +14,7 @@ if (Test-Path (Join-Path $RootDir ".env")) {
 
 $AppPort = if ($env:APP_PORT) { $env:APP_PORT } else { "8080" }
 $PostgresHostPort = if ($env:POSTGRES_HOST_PORT) { $env:POSTGRES_HOST_PORT } else { "5433" }
+$FrontendPort = if ($env:FRONTEND_PORT) { $env:FRONTEND_PORT } else { "3000" }
 $Status = 0
 
 Write-Host "== Cartridge System Health Check =="
@@ -28,7 +29,22 @@ try {
 }
 
 Write-Host ""
-Write-Host "[2] API check"
+Write-Host "[2] Frontend check"
+try {
+    $frontResp = Invoke-WebRequest -UseBasicParsing -Uri "http://localhost:$FrontendPort" -TimeoutSec 5
+    if ($frontResp.StatusCode -eq 200) {
+        Write-Host "  OK: frontend responds on port $FrontendPort (HTTP 200)"
+    } else {
+        Write-Host "  FAIL: frontend returned HTTP $($frontResp.StatusCode)"
+        $Status = 1
+    }
+} catch {
+    Write-Host "  FAIL: frontend check failed on port $FrontendPort"
+    $Status = 1
+}
+
+Write-Host ""
+Write-Host "[3] API check"
 try {
     $resp = Invoke-WebRequest -UseBasicParsing -Uri "http://localhost:$AppPort/api/departments" -TimeoutSec 5
     if ($resp.StatusCode -eq 200) {
@@ -43,7 +59,19 @@ try {
 }
 
 Write-Host ""
-Write-Host "[3] TCP ports"
+Write-Host "[4] TCP ports"
+try {
+    $frontListen = Get-NetTCPConnection -State Listen -LocalPort ([int]$FrontendPort) -ErrorAction SilentlyContinue
+    if ($frontListen) {
+        Write-Host "  OK: frontend port $FrontendPort is listening"
+    } else {
+        Write-Host "  FAIL: frontend port $FrontendPort is not listening"
+        $Status = 1
+    }
+} catch {
+    Write-Host "  WARN: unable to check frontend port via Get-NetTCPConnection"
+}
+
 try {
     $appListen = Get-NetTCPConnection -State Listen -LocalPort ([int]$AppPort) -ErrorAction SilentlyContinue
     if ($appListen) {
@@ -69,7 +97,7 @@ try {
 }
 
 Write-Host ""
-Write-Host "[4] Disk usage"
+Write-Host "[5] Disk usage"
 Get-PSDrive -PSProvider FileSystem | Select-Object Name, @{Name='UsedGB';Expression={[math]::Round(($_.Used/1GB),2)}}, @{Name='FreeGB';Expression={[math]::Round(($_.Free/1GB),2)}} | Out-Host
 
 Write-Host ""

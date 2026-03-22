@@ -8,6 +8,10 @@ import java.util.List;
 
 public interface CartridgeRepository extends JpaRepository<Cartridge, Long> {
 
+    boolean existsByInventoryCodeIgnoreCase(String inventoryCode);
+    long countByDepartmentId(Long departmentId);
+    long countByCartridgeModelId(Long cartridgeModelId);
+
     List<Cartridge> findByDepartmentId(Long departmentId);
 
     List<Cartridge> findByStatus(CartridgeStatus status);

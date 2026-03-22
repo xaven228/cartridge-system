@@ -43,6 +43,14 @@ public class Cartridge extends BaseEntity {
     @Column(nullable = false)
     private Integer quantity;
 
+    @Builder.Default
+    @Column(name = "refillable", nullable = false)
+    private Boolean refillable = true;
+
+    @Builder.Default
+    @Column(name = "empty", nullable = false)
+    private Boolean empty = false;
+
     @Enumerated(EnumType.STRING)
     @Column(nullable = false)
     private CartridgeStatus status;
@@ -60,4 +68,9 @@ public class Cartridge extends BaseEntity {
     @OneToMany(mappedBy = "cartridge", cascade = CascadeType.ALL, orphanRemoval = true)
     @Builder.Default
     private List<RefillHistory> refillHistory = new ArrayList<>();
+
+    @JsonIgnore
+    @OneToMany(mappedBy = "cartridge", cascade = CascadeType.ALL, orphanRemoval = true)
+    @Builder.Default
+    private List<PrinterInstallation> printerInstallations = new ArrayList<>();
 }

@@ -40,6 +40,10 @@ public class CartridgeModel extends BaseEntity {
     @Column(name = "resource_pages")
     private Integer resourcePages;
 
+    @Builder.Default
+    @Column(name = "refillable", nullable = false)
+    private Boolean refillable = true;
+
     @JsonIgnore
     @OneToMany(mappedBy = "cartridgeModel")
     @Builder.Default

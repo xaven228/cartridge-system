@@ -1,6 +1,7 @@
 package com.inventory.backend.controller;
 
-import com.inventory.backend.entity.Department;
+import com.inventory.backend.dto.DepartmentResponse;
+import com.inventory.backend.dto.UpdateDepartmentRequest;
 import com.inventory.backend.service.DepartmentService;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
@@ -17,12 +18,22 @@ public class DepartmentController {
     private final DepartmentService departmentService;
 
     @GetMapping
-    public List<Department> getAll() {
+    public List<DepartmentResponse> getAll() {
         return departmentService.getAll();
     }
 
     @PostMapping
-    public Department create(@Valid @RequestBody Department department) {
-        return departmentService.create(department);
+    public DepartmentResponse create(@Valid @RequestBody UpdateDepartmentRequest request) {
+        return departmentService.create(request);
+    }
+
+    @PutMapping("/{id}")
+    public DepartmentResponse update(@PathVariable Long id, @Valid @RequestBody UpdateDepartmentRequest request) {
+        return departmentService.update(id, request);
+    }
+
+    @DeleteMapping("/{id}")
+    public void delete(@PathVariable Long id) {
+        departmentService.delete(id);
     }
 }

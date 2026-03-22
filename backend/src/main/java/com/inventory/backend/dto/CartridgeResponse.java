@@ -27,6 +27,9 @@ public class CartridgeResponse {
     private String departmentName;
 
     private Integer quantity;
+    private Integer installedQuantity;
+    private Boolean refillable;
+    private Boolean empty;
     private CartridgeStatus status;
     private Integer refillCount;
     private LocalDate lastRefillDate;

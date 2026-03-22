@@ -36,4 +36,8 @@ public class Department extends BaseEntity {
     @OneToMany(mappedBy = "department")
     @Builder.Default
     private List<Cartridge> cartridges = new ArrayList<>();
+
+    @OneToMany(mappedBy = "department", cascade = CascadeType.ALL, orphanRemoval = true)
+    @Builder.Default
+    private List<Printer> printers = new ArrayList<>();
 }
