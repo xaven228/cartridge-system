@@ -10,9 +10,9 @@ public interface PrinterInstallationRepository extends JpaRepository<PrinterInst
 
     List<PrinterInstallation> findByCartridgeId(Long cartridgeId);
 
-    Optional<PrinterInstallation> findByCartridgeIdAndPrinterId(Long cartridgeId, Long printerId);
+    Optional<PrinterInstallation> findByCartridgeIdAndPrinterSlotId(Long cartridgeId, Long printerSlotId);
 
-    Optional<PrinterInstallation> findFirstByPrinterIdAndQuantityGreaterThan(Long printerId, Integer quantity);
+    Optional<PrinterInstallation> findFirstByPrinterSlotIdAndQuantityGreaterThan(Long printerSlotId, Integer quantity);
 
-    long countByPrinterId(Long printerId);
+    long countByPrinterSlotId(Long printerSlotId);
 }

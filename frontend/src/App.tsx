@@ -5,35 +5,49 @@ import {
   createCartridge,
   createCartridgeModel,
   createDepartment,
+  createPrinter,
   deleteCartridge,
   deleteCartridgeModel,
   deleteDepartment,
+  deletePrinter,
   getCartridges,
   getCartridgeModels,
   getActionLogs,
   getDepartments,
+  getPrinters,
   getRefillHistory,
   installCartridge,
+  markCartridgeEmpty,
   replaceCartridge,
   removeCartridgeInstallation,
   returnFromRefill,
   sendToRefill,
+  updateCartridgeModel,
   updateDepartment,
-  updateCartridgeRefillable,
+  updatePrinter,
   writeOff,
 } from './api'
-import type { ActionLogRecord, Cartridge, CartridgeModel, CartridgeStatus, Department, Printer, RefillHistoryRecord } from './api'
+import type { ActionLogRecord, Cartridge, CartridgeModel, CartridgeStatus, Department, Printer, PrinterType, RefillHistoryRecord } from './api'
 
 const STATUS_LIST: CartridgeStatus[] = ['IN_STOCK', 'INSTALLED', 'ON_REFILL', 'WRITTEN_OFF']
 const PAGE_SIZE = 8
 const STOCK_DEPARTMENT_NAME = 'Склад'
+const AUTH_STORAGE_KEY = 'cartridge-admin-session'
+const SAVED_PIN_STORAGE_KEY = 'cartridge-admin-pin'
+const SESSION_DURATION_MS = 30 * 60 * 1000
 
 type SortKey = 'departmentName' | 'status' | 'quantity' | 'refillCount'
 type ToastKind = 'success' | 'error'
-type TabKey = 'overview' | 'stock' | 'departments' | 'history' | 'create'
-type DetailAction = 'adjust' | 'send' | 'return' | 'writeoff' | null
+type TabKey = 'overview' | 'stock' | 'departments' | 'printers' | 'history' | 'create'
+type DetailAction = 'send' | 'return' | 'writeoff' | null
 type RemovalOutcome = 'STOCK' | 'REFILL' | 'WRITE_OFF'
-type DepartmentPrinterForm = { name: string; cartridgeModelId: number | '' }
+type BatchEntry = { quantity: number; comment: string }
+type PrinterSlotForm = { name: string; cartridgeModelId: number | '' }
+type DeleteTarget =
+  | { kind: 'printer'; id: number; label: string }
+  | { kind: 'department'; id: number; label: string }
+  | { kind: 'cartridge'; id: number; label: string }
+  | { kind: 'model'; id: number; label: string }
 
 interface Toast {
   id: number
@@ -81,6 +95,11 @@ function formatHistoryStatus(status: string): string {
   return status
 }
 
+function clampOperationQuantity(value: number, max: number): number {
+  if (!Number.isFinite(value) || value < 1) return 1
+  return Math.min(value, Math.max(1, max))
+}
+
 function formatActionType(actionType: string): string {
   const labels: Record<string, string> = {
     CARTRIDGE_CREATED: 'Приход',
@@ -90,6 +109,7 @@ function formatActionType(actionType: string): string {
     CARTRIDGE_SENT_TO_REFILL: 'Отправка на заправку',
     CARTRIDGE_RETURNED_FROM_REFILL: 'Возврат с заправки',
     CARTRIDGE_WRITTEN_OFF: 'Списание',
+    CARTRIDGE_MARKED_EMPTY: 'Пометка пустым',
     CARTRIDGE_REFILLABLE_CHANGED: 'Изменение типа',
     CARTRIDGE_DELETED: 'Удаление остатка',
     DEPARTMENT_CREATED: 'Создание отдела',
@@ -112,8 +132,23 @@ function balanceTone(value: number): string {
   return 'metric-positive'
 }
 
+function canDeleteCartridge(cartridge: Cartridge): boolean {
+  return cartridge.status !== 'ON_REFILL' && (cartridge.installedQuantity ?? 0) === 0
+}
+
+function getDeleteCartridgeHint(cartridge: Cartridge): string {
+  if (cartridge.status === 'ON_REFILL') {
+    return 'Нельзя удалить остаток, пока он на заправке.'
+  }
+  if ((cartridge.installedQuantity ?? 0) > 0) {
+    return 'Нельзя удалить остаток, пока часть количества установлена.'
+  }
+  return 'Удалить остаток'
+}
+
 export default function App() {
   const [departments, setDepartments] = useState<Department[]>([])
+  const [printers, setPrinters] = useState<Printer[]>([])
   const [models, setModels] = useState<CartridgeModel[]>([])
   const [cartridges, setCartridges] = useState<Cartridge[]>([])
   const [history, setHistory] = useState<RefillHistoryRecord[]>([])
@@ -128,6 +163,7 @@ export default function App() {
   const [currentPage, setCurrentPage] = useState(1)
   const [detailOpen, setDetailOpen] = useState(false)
   const [detailAction, setDetailAction] = useState<DetailAction>(null)
+  const [deleteTarget, setDeleteTarget] = useState<DeleteTarget | null>(null)
 
   const [selectedCartridgeId, setSelectedCartridgeId] = useState<number | ''>('')
   const [quantity, setQuantity] = useState<number>(0)
@@ -141,13 +177,18 @@ export default function App() {
 
   const [departmentName, setDepartmentName] = useState('')
   const [departmentDescription, setDepartmentDescription] = useState('')
-  const [departmentPrinters, setDepartmentPrinters] = useState<DepartmentPrinterForm[]>([{ name: '', cartridgeModelId: '' }])
   const [editingDepartmentId, setEditingDepartmentId] = useState<number | null>(null)
+  const [printerName, setPrinterName] = useState('')
+  const [printerDepartmentId, setPrinterDepartmentId] = useState<number | ''>('')
+  const [printerType, setPrinterType] = useState<PrinterType>('MONOCHROME')
+  const [printerSlots, setPrinterSlots] = useState<PrinterSlotForm[]>([{ name: 'Основной', cartridgeModelId: '' }])
+  const [editingPrinterId, setEditingPrinterId] = useState<number | null>(null)
   const [modelName, setModelName] = useState('')
-  const [newCartridgeModelId, setNewCartridgeModelId] = useState<number | ''>('')
-  const [newQuantity, setNewQuantity] = useState<number>(1)
-  const [newCartridgeRefillable, setNewCartridgeRefillable] = useState(true)
-  const [newComment, setNewComment] = useState('')
+  const [modelRefillable, setModelRefillable] = useState(true)
+  const [modelMinimumQuantity, setModelMinimumQuantity] = useState(0)
+  const [selectedBatchModelIds, setSelectedBatchModelIds] = useState<number[]>([])
+  const [batchEntries, setBatchEntries] = useState<Record<number, BatchEntry>>({})
+  const [activeBatchIndex, setActiveBatchIndex] = useState(0)
   const [installPrinterId, setInstallPrinterId] = useState<number | ''>('')
   const [preferredPrinterId, setPreferredPrinterId] = useState<number | ''>('')
   const [replaceOutcome, setReplaceOutcome] = useState<RemovalOutcome>('STOCK')
@@ -160,10 +201,33 @@ export default function App() {
 
   const [authPin, setAuthPin] = useState('')
   const [authError, setAuthError] = useState('')
+  const [authRemember, setAuthRemember] = useState(false)
   const [isAuthed, setIsAuthed] = useState(false)
   const [sessionUser, setSessionUser] = useState('')
+  const [sessionExpiresAt, setSessionExpiresAt] = useState<number | null>(null)
 
   const adminPin = import.meta.env.VITE_ADMIN_PIN || '1111'
+
+  const clearStoredSession = useCallback(() => {
+    localStorage.removeItem(AUTH_STORAGE_KEY)
+    setIsAuthed(false)
+    setSessionUser('')
+    setSessionExpiresAt(null)
+  }, [])
+
+  const persistSession = useCallback((user: string, rememberPin: boolean, pin: string) => {
+    const expiresAt = Date.now() + SESSION_DURATION_MS
+    localStorage.setItem(AUTH_STORAGE_KEY, JSON.stringify({ user, expiresAt }))
+    if (rememberPin) {
+      localStorage.setItem(SAVED_PIN_STORAGE_KEY, pin)
+    } else {
+      localStorage.removeItem(SAVED_PIN_STORAGE_KEY)
+    }
+
+    setIsAuthed(true)
+    setSessionUser(user)
+    setSessionExpiresAt(expiresAt)
+  }, [])
 
   const pushToast = useCallback((kind: ToastKind, text: string) => {
     const id = Date.now() + Math.floor(Math.random() * 1000)
@@ -188,8 +252,33 @@ export default function App() {
     )
   }, [cartridges, searchTerm])
 
+  const stockTableCartridges = useMemo(() => {
+    const collapsedWrittenOff = new Map<string, Cartridge>()
+
+    for (const item of visibleCartridges) {
+      if (item.status !== 'WRITTEN_OFF') {
+        collapsedWrittenOff.set(`row-${item.id}`, item)
+        continue
+      }
+
+      const key = [
+        item.cartridgeModelId,
+        item.departmentId,
+        item.refillable === false ? 'DISPOSABLE' : 'REFILLABLE',
+        item.status,
+      ].join(':')
+
+      const existing = collapsedWrittenOff.get(key)
+      if (!existing || item.id > existing.id) {
+        collapsedWrittenOff.set(key, item)
+      }
+    }
+
+    return Array.from(collapsedWrittenOff.values())
+  }, [visibleCartridges])
+
   const sortedCartridges = useMemo(() => {
-    const list = [...visibleCartridges]
+    const list = [...stockTableCartridges]
     list.sort((a, b) => {
       const va = a[sortKey]
       const vb = b[sortKey]
@@ -201,7 +290,7 @@ export default function App() {
       return sortDir === 'asc' ? sa.localeCompare(sb) : sb.localeCompare(sa)
     })
     return list
-  }, [visibleCartridges, sortDir, sortKey])
+  }, [sortDir, sortKey, stockTableCartridges])
 
   const totalPages = Math.max(1, Math.ceil(sortedCartridges.length / PAGE_SIZE))
   const paginatedCartridges = useMemo(() => {
@@ -240,24 +329,36 @@ export default function App() {
   const topHistory = useMemo(() => history.slice(0, 4), [history])
   const selectedCartridgeRefillable = selectedCartridge?.refillable !== false
   const selectedCartridgeEmpty = selectedCartridge?.empty === true
-  const selectedDepartmentPrinters: Printer[] = useMemo(() => {
-    if (!selectedCartridge) return []
-    return (departments.find((item) => item.id === selectedCartridge.departmentId)?.printers ?? []).filter(
-      (printer) => !printer.cartridgeModelId || printer.cartridgeModelId === selectedCartridge.cartridgeModelId,
-    )
-  }, [departments, selectedCartridge])
+  const sessionRemainingMinutes = sessionExpiresAt
+    ? Math.max(0, Math.ceil((sessionExpiresAt - Date.now()) / 60000))
+    : 0
 
   useEffect(() => {
-    if (!selectedDepartmentPrinters.some((printer) => printer.id === preferredPrinterId)) {
-      setPreferredPrinterId('')
+    const savedPin = localStorage.getItem(SAVED_PIN_STORAGE_KEY)
+    if (savedPin) {
+      setAuthPin(savedPin)
+      setAuthRemember(true)
     }
-  }, [preferredPrinterId, selectedDepartmentPrinters])
 
-  useEffect(() => {
-    if (preferredPrinterId && selectedDepartmentPrinters.some((printer) => printer.id === preferredPrinterId)) {
-      setInstallPrinterId(preferredPrinterId)
+    const rawSession = localStorage.getItem(AUTH_STORAGE_KEY)
+    if (!rawSession) return
+
+    try {
+      const parsed = JSON.parse(rawSession) as { user?: string; expiresAt?: number }
+      if (!parsed.user || !parsed.expiresAt || parsed.expiresAt <= Date.now()) {
+        localStorage.removeItem(AUTH_STORAGE_KEY)
+        return
+      }
+
+      setIsAuthed(true)
+      setSessionUser(parsed.user)
+      setSessionExpiresAt(parsed.expiresAt)
+      setActor(parsed.user)
+      setDetailActor(parsed.user)
+    } catch {
+      localStorage.removeItem(AUTH_STORAGE_KEY)
     }
-  }, [preferredPrinterId, selectedDepartmentPrinters])
+  }, [])
 
   useEffect(() => {
     setDetailOpen(false)
@@ -267,21 +368,46 @@ export default function App() {
   const departmentUsageRows = useMemo(
     () =>
       userDepartments.flatMap((department) =>
-        (department.printers ?? []).map((printer) => ({
-          id: `${department.id}-${printer.id ?? printer.name}`,
+        (department.printers ?? []).flatMap((printer) =>
+          (printer.slots ?? []).map((slot) => ({
+          id: `${department.id}-${printer.id ?? printer.name}-${slot.id ?? slot.name}`,
           printerId: printer.id ?? null,
+          slotId: slot.id ?? null,
           departmentId: department.id,
           departmentName: department.name,
           printerName: printer.name,
-          cartridgeModelId: printer.cartridgeModelId ?? null,
-          cartridgeModelName: printer.cartridgeModelName ?? 'Не назначен',
-          previousReplacementDate: printer.previousReplacementDate ?? null,
-          lastReplacementDate: printer.lastReplacementDate ?? null,
-          currentInstallation: printer.currentInstallation ?? null,
-        })),
+          printerType: printer.printerType,
+          slotName: slot.name,
+          cartridgeModelId: slot.cartridgeModelId ?? null,
+          cartridgeModelName: slot.cartridgeModelName ?? 'Не назначен',
+          previousReplacementDate: slot.previousReplacementDate ?? null,
+          lastReplacementDate: slot.lastReplacementDate ?? null,
+          currentInstallation: slot.currentInstallation ?? null,
+        }))),
       ),
     [userDepartments],
   )
+
+  const selectedDepartmentSlots = useMemo(() => {
+    if (!selectedCartridge) return []
+    return departmentUsageRows.filter(
+      (row) =>
+        row.departmentId === selectedCartridge.departmentId &&
+        row.cartridgeModelId === selectedCartridge.cartridgeModelId,
+    )
+  }, [departmentUsageRows, selectedCartridge])
+
+  useEffect(() => {
+    if (!selectedDepartmentSlots.some((slot) => slot.slotId === preferredPrinterId)) {
+      setPreferredPrinterId('')
+    }
+  }, [preferredPrinterId, selectedDepartmentSlots])
+
+  useEffect(() => {
+    if (preferredPrinterId && selectedDepartmentSlots.some((slot) => slot.slotId === preferredPrinterId)) {
+      setInstallPrinterId(preferredPrinterId)
+    }
+  }, [preferredPrinterId, selectedDepartmentSlots])
 
   const cartridgeDemandSummary = useMemo(() => {
     const stockByModel = cartridges.reduce<Record<string, number>>((acc, cartridge) => {
@@ -310,15 +436,99 @@ export default function App() {
       .sort((a, b) => a.replacementBalance - b.replacementBalance || a.modelName.localeCompare(b.modelName))
   }, [cartridges, departmentUsageRows])
 
+  const selectedBatchModels = useMemo(
+    () => selectedBatchModelIds.map((id) => models.find((item) => item.id === id)).filter(Boolean) as CartridgeModel[],
+    [models, selectedBatchModelIds],
+  )
+
+  const activeBatchModel = selectedBatchModels[activeBatchIndex] ?? null
+  const activeBatchEntry = activeBatchModel ? batchEntries[activeBatchModel.id] : undefined
+
+  const modelStockSummary = useMemo(() => {
+    const usageByModelId = departmentUsageRows.reduce<Record<number, number>>((acc, row) => {
+      if (!row.cartridgeModelId) return acc
+      acc[row.cartridgeModelId] = (acc[row.cartridgeModelId] ?? 0) + 1
+      return acc
+    }, {})
+
+    return models
+      .map((model) => {
+        const related = cartridges.filter((item) => item.cartridgeModelId === model.id)
+        const ready = related
+          .filter((item) => item.status === 'IN_STOCK' && item.empty !== true)
+          .reduce((sum, item) => sum + item.quantity, 0)
+        const empty = related
+          .filter((item) => item.status === 'IN_STOCK' && item.empty === true)
+          .reduce((sum, item) => sum + item.quantity, 0)
+        const onRefill = related
+          .filter((item) => item.status === 'ON_REFILL')
+          .reduce((sum, item) => sum + item.quantity, 0)
+        const minimumQuantity = model.minimumQuantity ?? 0
+        const balance = ready - minimumQuantity
+        return {
+          ...model,
+          ready,
+          empty,
+          onRefill,
+          assignedPoints: usageByModelId[model.id] ?? 0,
+          balance,
+        }
+      })
+      .sort((a, b) => a.balance - b.balance || a.name.localeCompare(b.name))
+  }, [cartridges, departmentUsageRows, models])
+
+  const refillableModelSummary = useMemo(
+    () => modelStockSummary.filter((item) => item.refillable),
+    [modelStockSummary],
+  )
+
+  const disposableModelSummary = useMemo(
+    () => modelStockSummary.filter((item) => !item.refillable),
+    [modelStockSummary],
+  )
+
+  const modelSummaryById = useMemo(
+    () => Object.fromEntries(modelStockSummary.map((item) => [item.id, item])),
+    [modelStockSummary],
+  )
+
+  const disposableWrittenOffByModel = useMemo(() => {
+    const createdByModel = actionLogs.reduce<Record<string, number>>((acc, log) => {
+      if (log.actionType !== 'CARTRIDGE_CREATED') return acc
+      if (!log.details?.includes('тип: одноразовый')) return acc
+
+      const match = log.details.match(/Приход в остаток:\s*(\d+)/)
+      const quantity = match ? Number(match[1]) : 0
+      if (quantity > 0) {
+        acc[log.targetName] = (acc[log.targetName] ?? 0) + quantity
+      }
+      return acc
+    }, {})
+
+    const activeByModel = cartridges.reduce<Record<string, number>>((acc, cartridge) => {
+      if (cartridge.refillable !== false) return acc
+      if (cartridge.status === 'WRITTEN_OFF') return acc
+      acc[cartridge.cartridgeModelName] = (acc[cartridge.cartridgeModelName] ?? 0) + cartridge.quantity
+      return acc
+    }, {})
+
+    return Object.keys(createdByModel).reduce<Record<string, number>>((acc, modelName) => {
+      acc[modelName] = Math.max(0, (createdByModel[modelName] ?? 0) - (activeByModel[modelName] ?? 0))
+      return acc
+    }, {})
+  }, [actionLogs, cartridges])
+
   const refreshCatalog = useCallback(async () => {
     setLoading(true)
     try {
-      const [deps, loadedModels, cart] = await Promise.all([
+      const [deps, loadedPrinters, loadedModels, cart] = await Promise.all([
         getDepartments(),
+        getPrinters(),
         getCartridgeModels(),
         getCartridges(),
       ])
       setDepartments(deps)
+      setPrinters(loadedPrinters)
       setModels(loadedModels)
       setCartridges(cart)
       setActionLogs(await getActionLogs())
@@ -372,6 +582,22 @@ export default function App() {
     if (currentPage > totalPages) setCurrentPage(totalPages)
   }, [currentPage, totalPages])
 
+  useEffect(() => {
+    setSelectedBatchModelIds((current) => current.filter((id) => models.some((model) => model.id === id)))
+    setBatchEntries((current) => {
+      const next = Object.fromEntries(
+        Object.entries(current).filter(([key]) => models.some((model) => model.id === Number(key))),
+      )
+      return next
+    })
+  }, [models])
+
+  useEffect(() => {
+    if (activeBatchIndex >= selectedBatchModels.length) {
+      setActiveBatchIndex(Math.max(0, selectedBatchModels.length - 1))
+    }
+  }, [activeBatchIndex, selectedBatchModels.length])
+
   async function applyFilters() {
     setLoading(true)
     try {
@@ -400,10 +626,8 @@ export default function App() {
   }
 
   function confirmAdminPin(): boolean {
-    const pin = window.prompt('Введите админский PIN для подтверждения удаления')
-    if (pin === null) return false
-    if (pin !== adminPin) {
-      pushToast('error', 'Неверный админский PIN.')
+    if (!isAuthed) {
+      setAuthError('Для этого действия нужно войти заново.')
       return false
     }
     return true
@@ -413,14 +637,6 @@ export default function App() {
     setEditingDepartmentId(department.id)
     setDepartmentName(department.name)
     setDepartmentDescription(department.description || '')
-    setDepartmentPrinters(
-      (department.printers ?? []).length > 0
-        ? (department.printers ?? []).map((printer) => ({
-            name: printer.name,
-            cartridgeModelId: printer.cartridgeModelId ?? '',
-          }))
-        : [{ name: '', cartridgeModelId: '' }],
-    )
     setActiveTab('departments')
   }
 
@@ -428,28 +644,57 @@ export default function App() {
     setEditingDepartmentId(null)
     setDepartmentName('')
     setDepartmentDescription('')
-    setDepartmentPrinters([{ name: '', cartridgeModelId: '' }])
   }
 
-  function onQuickAdjustQuantity(cartridge: Cartridge) {
-    const answer = window.prompt(
-      `Введите новый остаток для "${cartridge.cartridgeModelName}" в отделе "${cartridge.departmentName}"`,
-      String(cartridge.quantity),
-    )
-    if (answer === null) return
+  function requestDelete(target: DeleteTarget) {
+    if (!confirmAdminPin()) return
+    setDeleteTarget(target)
+  }
 
-    const nextQuantity = Number(answer)
-    if (!Number.isInteger(nextQuantity) || nextQuantity < 0) {
-      pushToast('error', 'Количество должно быть целым числом не меньше 0.')
-      return
+  function confirmDeleteTarget() {
+    if (!deleteTarget) return
+
+    switch (deleteTarget.kind) {
+      case 'printer':
+        void withAction(async () => {
+          await deletePrinter(deleteTarget.id)
+          if (editingPrinterId === deleteTarget.id) resetPrinterForm()
+          setDeleteTarget(null)
+        }, 'Принтер удален.')
+        break
+      case 'department':
+        void withAction(async () => {
+          await deleteDepartment(deleteTarget.id)
+          if (editingDepartmentId === deleteTarget.id) resetDepartmentForm()
+          setDeleteTarget(null)
+        }, 'Отдел удален.')
+        break
+      case 'cartridge':
+        void withAction(async () => {
+          await deleteCartridge(deleteTarget.id)
+          if (selectedCartridgeId === deleteTarget.id) {
+            setSelectedCartridgeId('')
+            setDetailOpen(false)
+          }
+          setDeleteTarget(null)
+        }, 'Картриджный остаток удален.')
+        break
+      case 'model':
+        void withAction(async () => {
+          await deleteCartridgeModel(deleteTarget.id)
+          setSelectedBatchModelIds((current) => current.filter((item) => item !== deleteTarget.id))
+          setBatchEntries((current) => {
+            const next = { ...current }
+            delete next[deleteTarget.id]
+            return next
+          })
+          setDeleteTarget(null)
+        }, 'Модель картриджа удалена.')
+        break
     }
-
-    void withAction(async () => {
-      await adjustQuantity(cartridge.id, nextQuantity, cartridge.comment || '')
-    }, 'Остаток обновлен.')
   }
 
-  async function handleQuickReplace(printerId: number, cartridgeModelId: number, hasInstalled: boolean) {
+  async function handleQuickReplace(slotId: number, cartridgeModelId: number, hasInstalled: boolean) {
     const availableCartridge = cartridges.find(
       (item) =>
         item.cartridgeModelId === cartridgeModelId &&
@@ -466,7 +711,7 @@ export default function App() {
     let removedOutcome: RemovalOutcome = 'WRITE_OFF'
     let successText = 'Картридж установлен, остаток уменьшен.'
     if (hasInstalled) {
-      const installedCartridgeId = departmentUsageRows.find((row) => row.printerId === printerId)?.currentInstallation?.cartridgeId
+      const installedCartridgeId = departmentUsageRows.find((row) => row.slotId === slotId)?.currentInstallation?.cartridgeId
       const installedCartridge = installedCartridgeId
         ? cartridges.find((item) => item.id === installedCartridgeId)
         : undefined
@@ -477,10 +722,10 @@ export default function App() {
         : 'Замена выполнена. Старый картридж списан.'
     }
 
-    await withAction(async () => {
+      await withAction(async () => {
       if (hasInstalled) {
         await replaceCartridge(availableCartridge.id, {
-          printerId,
+          printerId: slotId,
           removedOutcome,
           comment: '',
           actionDate: today(),
@@ -489,8 +734,28 @@ export default function App() {
         return
       }
 
-      await installCartridge(availableCartridge.id, printerId, 1, '')
+      await installCartridge(availableCartridge.id, slotId, 1, '')
     }, successText)
+  }
+
+  function onQuickMarkEmpty(cartridgeId: number) {
+    void withAction(async () => {
+      await markCartridgeEmpty(cartridgeId, 'Помечен пустым в отделе')
+    }, 'Картридж помечен как пустой.')
+  }
+
+  function onQuickRemove(slotId: number, installation: NonNullable<(typeof departmentUsageRows)[number]['currentInstallation']>) {
+    void withAction(async () => {
+      await removeCartridgeInstallation(
+        installation.cartridgeId,
+        slotId,
+        1,
+        true,
+        'Убран из принтера'
+      )
+    }, installation.refillable === false
+      ? 'Картридж убран и списан.'
+      : 'Картридж убран и возвращен в остаток как пустой.')
   }
 
   function requireCartridge(): number | null {
@@ -522,8 +787,9 @@ export default function App() {
     }
     const id = requireCartridge()
     if (!id) return
+    const refillQuantity = clampOperationQuantity(quantity, selectedCartridge?.quantity ?? 1)
     void withAction(async () => {
-      await sendToRefill(id, dateValue, actor, comment)
+      await sendToRefill(id, refillQuantity, dateValue, actor, comment)
     }, 'Картридж отправлен на заправку.')
   }
 
@@ -531,8 +797,9 @@ export default function App() {
     event.preventDefault()
     const id = requireCartridge()
     if (!id) return
+    const returnedQuantity = clampOperationQuantity(quantity, selectedCartridge?.quantity ?? 1)
     void withAction(async () => {
-      await returnFromRefill(id, dateValue, actor, comment)
+      await returnFromRefill(id, returnedQuantity, dateValue, actor, comment)
     }, 'Картридж возвращен с заправки.')
   }
 
@@ -544,14 +811,6 @@ export default function App() {
     void withAction(async () => {
       await writeOff(id, comment)
     }, 'Картридж списан.')
-  }
-
-  function onChangeRefillable(refillable: boolean) {
-    const id = requireCartridge()
-    if (!id) return
-    void withAction(async () => {
-      await updateCartridgeRefillable(id, refillable)
-    }, refillable ? 'Картридж помечен как заправляемый.' : 'Картридж помечен как одноразовый.')
   }
 
   function onReplaceCartridge(event: FormEvent) {
@@ -612,17 +871,14 @@ export default function App() {
       setAuthError('Неверный админский PIN.')
       return
     }
-    setIsAuthed(true)
-    setSessionUser('Администратор')
+    persistSession('Администратор', authRemember, authPin)
     setActor('Администратор')
     setDetailActor('Администратор')
-    setAuthPin('')
     setActiveTab('departments')
   }
 
   function onLogout() {
-    setIsAuthed(false)
-    setSessionUser('')
+    clearStoredSession()
     setSelectedCartridgeId('')
     setHistory([])
     setToasts([])
@@ -644,14 +900,6 @@ export default function App() {
     setDetailOpen(true)
   }
 
-  function onDetailAdjustQuantity(event: FormEvent) {
-    event.preventDefault()
-    if (!selectedCartridge) return
-    void withAction(async () => {
-      await adjustQuantity(selectedCartridge.id, detailQuantity, detailComment)
-    }, 'Количество обновлено.')
-  }
-
   function onDetailSendToRefill(event: FormEvent) {
     event.preventDefault()
     if (!selectedCartridge) return
@@ -663,16 +911,18 @@ export default function App() {
       pushToast('error', 'На заправку можно отправлять только пустой картридж.')
       return
     }
+    const refillQuantity = clampOperationQuantity(detailQuantity, selectedCartridge.quantity)
     void withAction(async () => {
-      await sendToRefill(selectedCartridge.id, detailDateValue, detailActor, detailComment)
+      await sendToRefill(selectedCartridge.id, refillQuantity, detailDateValue, detailActor, detailComment)
     }, 'Картридж отправлен на заправку.')
   }
 
   function onDetailReturnFromRefill(event: FormEvent) {
     event.preventDefault()
     if (!selectedCartridge) return
+    const returnedQuantity = clampOperationQuantity(detailQuantity, selectedCartridge.quantity)
     void withAction(async () => {
-      await returnFromRefill(selectedCartridge.id, detailDateValue, detailActor, detailComment)
+      await returnFromRefill(selectedCartridge.id, returnedQuantity, detailDateValue, detailActor, detailComment)
     }, 'Картридж возвращен с заправки.')
   }
 
@@ -695,13 +945,6 @@ export default function App() {
       const payload = {
         name: departmentName.trim(),
         description: departmentDescription.trim(),
-        printers: departmentPrinters
-          .map((printer) => ({
-            name: printer.name.trim(),
-            cartridgeModel: printer.cartridgeModelId ? { id: printer.cartridgeModelId } : undefined,
-          }))
-          .filter((printer) => printer.name)
-          .map((printer) => ({ name: printer.name, cartridgeModel: printer.cartridgeModel })),
       }
 
       if (editingDepartmentId) {
@@ -720,93 +963,216 @@ export default function App() {
       return
     }
     void withAction(async () => {
-      await createCartridgeModel({ name: modelName.trim() })
+      await createCartridgeModel({
+        name: modelName.trim(),
+        refillable: modelRefillable,
+        minimumQuantity: Math.max(0, modelMinimumQuantity),
+      })
       setModelName('')
+      setModelRefillable(true)
+      setModelMinimumQuantity(0)
     }, 'Модель картриджа создана.')
+  }
+
+  function toggleBatchModel(modelId: number) {
+    setSelectedBatchModelIds((current) => {
+      if (current.includes(modelId)) {
+        return current.filter((id) => id !== modelId)
+      }
+      return [...current, modelId]
+    })
+    setBatchEntries((current) => ({
+      ...current,
+      [modelId]: current[modelId] ?? { quantity: 1, comment: '' },
+    }))
+  }
+
+  function updateBatchEntry(modelId: number, patch: Partial<BatchEntry>) {
+    setBatchEntries((current) => ({
+      ...current,
+      [modelId]: {
+        quantity: current[modelId]?.quantity ?? 1,
+        comment: current[modelId]?.comment ?? '',
+        ...patch,
+      },
+    }))
   }
 
   function onCreateCartridge(event: FormEvent) {
     event.preventDefault()
-    if (!newCartridgeModelId) {
-      pushToast('error', 'Выберите модель картриджа.')
+    if (selectedBatchModels.length === 0) {
+      pushToast('error', 'Выберите хотя бы одну модель для пополнения.')
       return
     }
     void withAction(async () => {
-      await createCartridge({
-        cartridgeModelId: newCartridgeModelId,
-        refillable: newCartridgeRefillable,
-        quantity: newQuantity,
-        comment: newComment.trim(),
-      })
-      setNewCartridgeModelId('')
-      setNewCartridgeRefillable(true)
-      setNewQuantity(1)
-      setNewComment('')
+      for (const model of selectedBatchModels) {
+        const entry = batchEntries[model.id] ?? { quantity: 1, comment: '' }
+        await createCartridge({
+          cartridgeModelId: model.id,
+          quantity: Math.max(0, entry.quantity),
+          comment: entry.comment.trim(),
+        })
+      }
+      setSelectedBatchModelIds([])
+      setBatchEntries({})
+      setActiveBatchIndex(0)
       setActiveTab('stock')
-    }, 'Картридж добавлен.')
+    }, 'Партия картриджей добавлена в остаток.')
+  }
+
+  function onSaveModelSettings(model: CartridgeModel) {
+    void withAction(async () => {
+      await updateCartridgeModel(model.id, {
+        name: model.name,
+        refillable: model.refillable,
+        minimumQuantity: Math.max(0, model.minimumQuantity ?? 0),
+      })
+    }, `Параметры модели "${model.name}" сохранены.`)
+  }
+
+  function onChangeModelField(id: number, patch: Partial<CartridgeModel>) {
+    setModels((current) =>
+      current.map((item) =>
+        item.id === id
+          ? {
+              ...item,
+              ...patch,
+            }
+          : item,
+      ),
+    )
+  }
+
+  function resetPrinterForm() {
+    setEditingPrinterId(null)
+    setPrinterName('')
+    setPrinterDepartmentId('')
+    setPrinterType('MONOCHROME')
+    setPrinterSlots([{ name: 'Основной', cartridgeModelId: '' }])
+  }
+
+  function beginPrinterEdit(printer: Printer) {
+    setEditingPrinterId(printer.id ?? null)
+    setPrinterName(printer.name)
+    setPrinterDepartmentId(printer.departmentId ?? '')
+    setPrinterType(printer.printerType)
+    setPrinterSlots(
+      (printer.slots ?? []).map((slot) => ({
+        name: slot.name,
+        cartridgeModelId: slot.cartridgeModelId ?? '',
+      })),
+    )
+    setActiveTab('printers')
+  }
+
+  function applyPrinterType(type: PrinterType) {
+    setPrinterType(type)
+    if (type === 'MONOCHROME') {
+      setPrinterSlots((current) => [
+        {
+          name: current[0]?.name?.trim() ? current[0].name : 'Основной',
+          cartridgeModelId: current[0]?.cartridgeModelId ?? '',
+        },
+      ])
+      return
+    }
+
+    setPrinterSlots((current) =>
+      current.length >= 4
+        ? current
+        : [
+            { name: 'Black', cartridgeModelId: current[0]?.cartridgeModelId ?? '' },
+            { name: 'Cyan', cartridgeModelId: '' },
+            { name: 'Magenta', cartridgeModelId: '' },
+            { name: 'Yellow', cartridgeModelId: '' },
+          ],
+    )
+  }
+
+  function onCreatePrinter(event: FormEvent) {
+    event.preventDefault()
+    if (!printerName.trim()) {
+      pushToast('error', 'Введите название принтера.')
+      return
+    }
+    if (!printerDepartmentId) {
+      pushToast('error', 'Выберите отдел для принтера.')
+      return
+    }
+    if (printerSlots.some((slot) => !slot.name.trim() || !slot.cartridgeModelId)) {
+      pushToast('error', 'У каждого слота должно быть имя и модель картриджа.')
+      return
+    }
+
+    const payload = {
+      name: printerName.trim(),
+      departmentId: printerDepartmentId,
+      printerType,
+      slots: printerSlots.map((slot) => ({
+        name: slot.name.trim(),
+        cartridgeModelId: Number(slot.cartridgeModelId),
+      })),
+    }
+
+    void withAction(async () => {
+      if (editingPrinterId) {
+        await updatePrinter(editingPrinterId, payload)
+      } else {
+        await createPrinter(payload)
+      }
+      resetPrinterForm()
+    }, editingPrinterId ? 'Принтер обновлен.' : 'Принтер создан.')
+  }
+
+  function onDeletePrinter(id: number, name: string) {
+    requestDelete({ kind: 'printer', id, label: name })
   }
 
   function onDeleteDepartment(id: number, name: string) {
-    if (!confirmAdminPin()) return
-    if (!window.confirm(`Удалить отдел "${name}"?`)) return
-    void withAction(async () => {
-      await deleteDepartment(id)
-      if (editingDepartmentId === id) resetDepartmentForm()
-    }, 'Отдел удален.')
+    requestDelete({ kind: 'department', id, label: name })
   }
 
   function onDeleteCartridge(id: number, title: string) {
-    if (!confirmAdminPin()) return
-    if (!window.confirm(`Удалить остаток "${title}"?`)) return
-    void withAction(async () => {
-      await deleteCartridge(id)
-      if (selectedCartridgeId === id) {
-        setSelectedCartridgeId('')
-        setDetailOpen(false)
-      }
-    }, 'Картриджный остаток удален.')
+    requestDelete({ kind: 'cartridge', id, label: title })
   }
 
   function onDeleteCartridgeModel(id: number, name: string) {
-    if (!confirmAdminPin()) return
-    if (!window.confirm(`Удалить модель "${name}"?`)) return
-    void withAction(async () => {
-      await deleteCartridgeModel(id)
-      if (newCartridgeModelId === id) {
-        setNewCartridgeModelId('')
-      }
-    }, 'Модель картриджа удалена.')
-  }
-
-  if (!isAuthed) {
-    return (
-      <div className="app-shell">
-        <section className="auth-panel admin-auth-panel">
-          <div className="auth-deco auth-deco-left" />
-          <div className="auth-deco auth-deco-right" />
-          <p className="eyebrow">Admin Access</p>
-          <h1>Control Core</h1>
-          <p className="subtitle">Единая админ-панель учета картриджей, отделов и сервисных операций.</p>
-          <form className="auth-form" onSubmit={onSignIn}>
-            <label>
-              Админский PIN
-              <input
-                type="password"
-                value={authPin}
-                onChange={(e) => setAuthPin(e.target.value)}
-                placeholder="Введите PIN администратора"
-              />
-            </label>
-            <button type="submit">Войти в панель</button>
-          </form>
-          {authError && <p className="error">{authError}</p>}
-        </section>
-      </div>
-    )
+    requestDelete({ kind: 'model', id, label: name })
   }
 
   return (
     <div className="app-shell">
+      {!isAuthed && (
+        <section className="auth-overlay">
+          <div className="auth-panel admin-auth-panel">
+            <p className="eyebrow">Admin Access</p>
+            <h1>Вход в панель</h1>
+            <p className="subtitle">Сессия хранится 30 минут. PIN можно сохранить на этом устройстве.</p>
+            <form className="auth-form" onSubmit={onSignIn}>
+              <label>
+                Админский PIN
+                <input
+                  type="password"
+                  value={authPin}
+                  onChange={(e) => setAuthPin(e.target.value)}
+                  placeholder="Введите PIN администратора"
+                  autoFocus
+                />
+              </label>
+              <label className="checkbox-line">
+                <input
+                  type="checkbox"
+                  checked={authRemember}
+                  onChange={(e) => setAuthRemember(e.target.checked)}
+                />
+                <span>Запомнить PIN на этом устройстве</span>
+              </label>
+              <button type="submit">Войти в панель</button>
+            </form>
+            {authError && <p className="error">{authError}</p>}
+          </div>
+        </section>
+      )}
       <header className="simple-header">
         <div>
           <h1>Учет картриджей</h1>
@@ -815,6 +1181,7 @@ export default function App() {
         <div className="table-actions">
           {loading && <span className="table-muted">Синхронизация...</span>}
           <span className="table-muted">{sessionUser}</span>
+          {isAuthed && <span className="table-muted">Сессия: {sessionRemainingMinutes} мин.</span>}
           <button className="ghost" onClick={onLogout}>Выйти</button>
         </div>
       </header>
@@ -825,6 +1192,9 @@ export default function App() {
         <button className={activeTab === 'stock' ? 'active' : ''} onClick={() => setActiveTab('stock')}>Картриджи</button>
         <button className={activeTab === 'departments' ? 'active' : ''} onClick={() => setActiveTab('departments')}>
           Отделы
+        </button>
+        <button className={activeTab === 'printers' ? 'active' : ''} onClick={() => setActiveTab('printers')}>
+          Принтеры
         </button>
         <button className={activeTab === 'history' ? 'active' : ''} onClick={() => setActiveTab('history')}>
           История
@@ -907,16 +1277,6 @@ export default function App() {
                     <p>Установлено: {selectedCartridge.installedQuantity ?? 0}</p>
                     <p>Тип: {selectedCartridgeRefillable ? 'Заправляемый' : 'Одноразовый'}</p>
                     <p>Состояние: {selectedCartridgeEmpty ? 'Пустой' : 'Готов к установке'}</p>
-                    <label>
-                      Обращение
-                      <select
-                        value={selectedCartridgeRefillable ? 'REFILLABLE' : 'DISPOSABLE'}
-                        onChange={(e) => onChangeRefillable(e.target.value === 'REFILLABLE')}
-                      >
-                        <option value="REFILLABLE">Заправляется</option>
-                        <option value="DISPOSABLE">Не заправляется</option>
-                      </select>
-                    </label>
                   </div>
                 ) : (
                   <div className="empty-state">Выберите картридж, чтобы открыть операции.</div>
@@ -947,15 +1307,15 @@ export default function App() {
                 <form onSubmit={onReplaceCartridge} className="form-card command-form">
                   <h3>Заменить картридж</h3>
                   <label>
-                    Точка замены
+                    Слот принтера
                     <select
                       value={installPrinterId}
                       onChange={(e) => setInstallPrinterId(e.target.value ? Number(e.target.value) : '')}
                     >
                       <option value="">Выберите...</option>
-                      {selectedDepartmentPrinters.map((printer) => (
-                        <option key={printer.id} value={printer.id}>
-                          {printer.name}
+                      {selectedDepartmentSlots.map((slot) => (
+                        <option key={slot.slotId} value={slot.slotId ?? ''}>
+                          {slot.printerName} · {slot.slotName}
                         </option>
                       ))}
                     </select>
@@ -980,7 +1340,7 @@ export default function App() {
                     Комментарий
                     <input value={comment} onChange={(e) => setComment(e.target.value)} />
                   </label>
-                  <button type="submit" disabled={!selectedCartridgeId || selectedDepartmentPrinters.length === 0}>
+                  <button type="submit" disabled={!selectedCartridgeId || selectedDepartmentSlots.length === 0}>
                     Заменить
                   </button>
                 </form>
@@ -988,15 +1348,15 @@ export default function App() {
                 <form onSubmit={onRemoveInstallation} className="form-card command-form">
                   <h3>Снять с принтера</h3>
                   <label>
-                    Принтер отдела
+                    Слот принтера
                     <select
                       value={removePrinterId}
                       onChange={(e) => setRemovePrinterId(e.target.value ? Number(e.target.value) : '')}
                     >
                       <option value="">Выберите...</option>
-                      {selectedDepartmentPrinters.map((printer) => (
-                        <option key={printer.id} value={printer.id}>
-                          {printer.name}
+                      {selectedDepartmentSlots.map((slot) => (
+                        <option key={slot.slotId} value={slot.slotId ?? ''}>
+                          {slot.printerName} · {slot.slotName}
                         </option>
                       ))}
                     </select>
@@ -1022,7 +1382,7 @@ export default function App() {
                     Комментарий
                     <input value={comment} onChange={(e) => setComment(e.target.value)} />
                   </label>
-                  <button type="submit" disabled={!selectedCartridgeId || selectedDepartmentPrinters.length === 0}>
+                  <button type="submit" disabled={!selectedCartridgeId || selectedDepartmentSlots.length === 0}>
                     Снять
                   </button>
                 </form>
@@ -1108,7 +1468,7 @@ export default function App() {
                 {topHistory.map((entry) => (
                   <article key={entry.id} className="history-preview-card">
                     <strong>{selectedCartridge?.cartridgeModelName || 'История операций'}</strong>
-                    <p>{formatHistoryStatus(entry.status)}</p>
+                    <p>{formatHistoryStatus(entry.status)} · {entry.quantity} шт.</p>
                     <span>{entry.sentAt || entry.returnedAt || '-'}</span>
                   </article>
                 ))}
@@ -1213,8 +1573,8 @@ export default function App() {
                   <tr key={item.id}>
                     <td>{item.cartridgeModelName}</td>
                     <td>{item.departmentName}</td>
-                    <td>{item.quantity}</td>
-                    <td>{item.installedQuantity ?? 0}</td>
+                    <td>{item.status === 'INSTALLED' ? '—' : item.quantity}</td>
+                    <td>{item.status === 'IN_STOCK' ? '—' : (item.installedQuantity ?? 0)}</td>
                     <td>
                       {(() => {
                         const stockState = getStockStateMeta(item)
@@ -1230,8 +1590,12 @@ export default function App() {
                         <button className="ghost" onClick={() => openDetails(item.id)}>
                           Детали
                         </button>
-                        <button onClick={() => onQuickAdjustQuantity(item)}>Изменить остаток</button>
-                        <button className="ghost danger-action" onClick={() => onDeleteCartridge(item.id, `${item.cartridgeModelName} / ${item.departmentName}`)}>
+                        <button
+                          className="ghost danger-action"
+                          onClick={() => onDeleteCartridge(item.id, `${item.cartridgeModelName} / ${item.departmentName}`)}
+                          disabled={!canDeleteCartridge(item)}
+                          title={getDeleteCartridgeHint(item)}
+                        >
                           Удалить
                         </button>
                       </div>
@@ -1284,7 +1648,8 @@ export default function App() {
                 <thead>
                   <tr>
                     <th>Отдел</th>
-                    <th>Точка замены</th>
+                    <th>Принтер</th>
+                    <th>Слот</th>
                     <th>Нужный картридж</th>
                     <th>Сейчас установлен</th>
                     <th>Предпоследняя замена</th>
@@ -1297,11 +1662,17 @@ export default function App() {
                     <tr key={row.id}>
                       <td>{row.departmentName}</td>
                       <td>{row.printerName}</td>
+                      <td>{row.slotName}</td>
                       <td>{row.cartridgeModelName}</td>
                       <td>
                         {row.currentInstallation ? (
                           <div className="replacement-point-state">
-                            <span className="status-badge status-installed">Установлен</span>
+                            <div className="table-actions">
+                              <span className="status-badge status-installed">Установлен</span>
+                              {row.currentInstallation.empty === true && (
+                                <span className="status-badge status-empty">Пустой</span>
+                              )}
+                            </div>
                             <span>{row.currentInstallation.cartridgeModelName}</span>
                           </div>
                         ) : (
@@ -1311,12 +1682,33 @@ export default function App() {
                       <td>{formatDate(row.previousReplacementDate)}</td>
                       <td>{formatDate(row.lastReplacementDate)}</td>
                       <td>
-                        {row.printerId && row.cartridgeModelId ? (
-                          <button
-                            onClick={() => void handleQuickReplace(row.printerId!, row.cartridgeModelId!, Boolean(row.currentInstallation))}
-                          >
-                            Заменить
-                          </button>
+                        {row.slotId && row.cartridgeModelId ? (
+                          <div className="table-actions">
+                            <button
+                              onClick={() => void handleQuickReplace(row.slotId!, row.cartridgeModelId!, Boolean(row.currentInstallation))}
+                            >
+                              Заменить
+                            </button>
+                            {row.currentInstallation && (
+                              <>
+                                <button
+                                  type="button"
+                                  className="ghost"
+                                  onClick={() => onQuickMarkEmpty(row.currentInstallation!.cartridgeId)}
+                                  disabled={row.currentInstallation.empty === true}
+                                >
+                                  Пустой
+                                </button>
+                                <button
+                                  type="button"
+                                  className="ghost"
+                                  onClick={() => onQuickRemove(row.slotId!, row.currentInstallation!)}
+                                >
+                                  Убран
+                                </button>
+                              </>
+                            )}
+                          </div>
                         ) : (
                           <span className="table-muted">Недоступно</span>
                         )}
@@ -1377,7 +1769,7 @@ export default function App() {
             <aside className="side-card">
               <p className="eyebrow">Create Department</p>
               <h3>{editingDepartmentId ? 'Изменить отдел' : 'Добавить отдел'}</h3>
-              <p className="table-muted">Отдел состоит из названия, описания и списка точек замены с нужными картриджами.</p>
+              <p className="table-muted">Отдел содержит только общие сведения. Принтеры и слоты теперь настраиваются отдельно во вкладке <strong>Принтеры</strong>.</p>
               <form onSubmit={onCreateDepartment} className="form-card compact-form">
                 <label>
                   Название
@@ -1391,61 +1783,6 @@ export default function App() {
                     placeholder="Например: административный блок, бухгалтерия, инженерная служба"
                   />
                 </label>
-                <div className="dynamic-list">
-                  <span className="field-label">Точки замены в отделе</span>
-                  {departmentPrinters.map((printer, index) => (
-                    <div key={index} className="dynamic-row">
-                      <input
-                        value={printer.name}
-                        onChange={(e) =>
-                          setDepartmentPrinters((current) =>
-                            current.map((item, itemIndex) =>
-                              itemIndex === index ? { ...item, name: e.target.value } : item,
-                            ),
-                          )
-                        }
-                        placeholder={`Точка замены ${index + 1}`}
-                      />
-                      <select
-                        value={printer.cartridgeModelId}
-                        onChange={(e) =>
-                          setDepartmentPrinters((current) =>
-                            current.map((item, itemIndex) =>
-                              itemIndex === index
-                                ? { ...item, cartridgeModelId: e.target.value ? Number(e.target.value) : '' }
-                                : item,
-                            ),
-                          )
-                        }
-                      >
-                        <option value="">Нужный картридж</option>
-                        {models.map((model) => (
-                          <option key={model.id} value={model.id}>
-                            {model.name}
-                          </option>
-                        ))}
-                      </select>
-                      <button
-                        type="button"
-                        className="ghost"
-                        onClick={() =>
-                          setDepartmentPrinters((current) =>
-                            current.length === 1 ? [{ name: '', cartridgeModelId: '' }] : current.filter((_, i) => i !== index),
-                          )
-                        }
-                      >
-                        Убрать
-                      </button>
-                    </div>
-                  ))}
-                  <button
-                    type="button"
-                    className="ghost"
-                    onClick={() => setDepartmentPrinters((current) => [...current, { name: '', cartridgeModelId: '' }])}
-                  >
-                    Добавить точку
-                  </button>
-                </div>
                 <div className="table-actions">
                   <button type="submit">{editingDepartmentId ? 'Сохранить изменения' : 'Создать отдел'}</button>
                   {editingDepartmentId && (
@@ -1453,6 +1790,125 @@ export default function App() {
                       Отмена
                     </button>
                   )}
+                </div>
+              </form>
+            </aside>
+          </div>
+        </section>
+      )}
+
+      {activeTab === 'printers' && (
+        <section className="departments-layout">
+          <section className="panel departments-main-panel">
+            <div className="section-heading">
+              <div>
+                <p className="eyebrow">Printers</p>
+                <h2>Принтеры и слоты картриджей</h2>
+                <p className="table-hint">Для цветных принтеров каждый цвет ведется как отдельный слот с собственной заменой.</p>
+              </div>
+            </div>
+            <div className="table-shell">
+              <table className="stock-table">
+                <thead>
+                  <tr>
+                    <th>Отдел</th>
+                    <th>Принтер</th>
+                    <th>Тип</th>
+                    <th>Слоты</th>
+                    <th>Действия</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {printers.map((printer) => (
+                    <tr key={printer.id}>
+                      <td>{printer.departmentName}</td>
+                      <td>{printer.name}</td>
+                      <td>{printer.printerType === 'COLOR' ? 'Цветной' : 'Ч/Б'}</td>
+                      <td>
+                        <div className="replacement-point-state">
+                          {printer.slots.map((slot) => (
+                            <span key={slot.id ?? slot.name}>
+                              {slot.name}: {slot.cartridgeModelName ?? 'Не назначен'}
+                            </span>
+                          ))}
+                        </div>
+                      </td>
+                      <td>
+                        <div className="table-actions">
+                          <button className="ghost" onClick={() => beginPrinterEdit(printer)}>Изменить</button>
+                          <button className="ghost danger-action" onClick={() => onDeletePrinter(printer.id!, printer.name)}>Удалить</button>
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              {printers.length === 0 && <div className="empty-state">Принтеров пока нет.</div>}
+            </div>
+          </section>
+
+          <div className="departments-bottom">
+            <aside className="side-card">
+              <p className="eyebrow">Printer Form</p>
+              <h3>{editingPrinterId ? 'Изменить принтер' : 'Добавить принтер'}</h3>
+              <form onSubmit={onCreatePrinter} className="form-card compact-form">
+                <label>
+                  Название принтера
+                  <input value={printerName} onChange={(e) => setPrinterName(e.target.value)} />
+                </label>
+                <label>
+                  Отдел
+                  <select value={printerDepartmentId} onChange={(e) => setPrinterDepartmentId(e.target.value ? Number(e.target.value) : '')}>
+                    <option value="">Выберите...</option>
+                    {userDepartments.map((department) => (
+                      <option key={department.id} value={department.id}>
+                        {department.name}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label>
+                  Тип принтера
+                  <select value={printerType} onChange={(e) => applyPrinterType(e.target.value as PrinterType)}>
+                    <option value="MONOCHROME">Ч/Б</option>
+                    <option value="COLOR">Цветной</option>
+                  </select>
+                </label>
+                <div className="dynamic-list">
+                  <span className="field-label">Слоты картриджей</span>
+                  {printerSlots.map((slot, index) => (
+                    <div key={index} className="dynamic-row">
+                      <input
+                        value={slot.name}
+                        onChange={(e) =>
+                          setPrinterSlots((current) => current.map((item, itemIndex) => itemIndex === index ? { ...item, name: e.target.value } : item))
+                        }
+                        placeholder={`Слот ${index + 1}`}
+                        disabled={printerType === 'COLOR' && ['Black', 'Cyan', 'Magenta', 'Yellow'].includes(slot.name)}
+                      />
+                      <select
+                        value={slot.cartridgeModelId}
+                        onChange={(e) =>
+                          setPrinterSlots((current) =>
+                            current.map((item, itemIndex) =>
+                              itemIndex === index ? { ...item, cartridgeModelId: e.target.value ? Number(e.target.value) : '' } : item,
+                            ),
+                          )
+                        }
+                      >
+                        <option value="">Модель картриджа</option>
+                        {models.map((model) => (
+                          <option key={model.id} value={model.id}>
+                            {model.name}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  ))}
+                </div>
+                <div className="table-actions">
+                  <button type="submit">{editingPrinterId ? 'Сохранить принтер' : 'Создать принтер'}</button>
+                  {editingPrinterId && <button type="button" className="ghost" onClick={resetPrinterForm}>Отмена</button>}
                 </div>
               </form>
             </aside>
@@ -1519,76 +1975,199 @@ export default function App() {
                   placeholder="Например: TK-1170"
                 />
               </label>
+              <label>
+                Тип модели
+                <select
+                  value={modelRefillable ? 'REFILLABLE' : 'DISPOSABLE'}
+                  onChange={(e) => setModelRefillable(e.target.value === 'REFILLABLE')}
+                >
+                  <option value="REFILLABLE">Заправляемый</option>
+                  <option value="DISPOSABLE">Незаправляемый</option>
+                </select>
+              </label>
+              <label>
+                Минимальный остаток
+                <input
+                  type="number"
+                  min={0}
+                  value={modelMinimumQuantity}
+                  onChange={(e) => setModelMinimumQuantity(Number(e.target.value))}
+                />
+              </label>
               <p className="form-help">
-                Нужна только модель картриджа. Модель принтера здесь больше не используется.
+                У модели задаются базовый тип и минимальный остаток. При пополнении тип теперь берется отсюда автоматически.
               </p>
               <button type="submit">Создать модель</button>
             </form>
 
             <div className="create-stock-layout">
               <form onSubmit={onCreateCartridge} className="form-card">
-                <h3>Добавить картриджи в остаток</h3>
+                <h3>Пакетное пополнение остатка</h3>
                 <p className="form-help">
-                  Остаток добавляется в общий запас. Отдел при пополнении больше не выбирается.
+                  Выберите несколько моделей. Для каждой появится одинаковая карточка пополнения, между ними можно переключаться.
                 </p>
-                <label>
-                  Модель
-                  <select
-                    value={newCartridgeModelId}
-                    onChange={(e) => setNewCartridgeModelId(e.target.value ? Number(e.target.value) : '')}
-                  >
-                    <option value="">Выберите...</option>
-                    {models.map((item) => (
-                      <option key={item.id} value={item.id}>
-                        {item.name}
-                      </option>
-                    ))}
-                  </select>
-                </label>
-                <p className="form-help">
-                  Список моделей справа. Где именно картридж используется, настраивается во вкладке <strong>Отделы</strong>.
-                </p>
-                <label>
-                  Тип картриджа
-                  <select
-                    value={newCartridgeRefillable ? 'REFILLABLE' : 'DISPOSABLE'}
-                    onChange={(e) => setNewCartridgeRefillable(e.target.value === 'REFILLABLE')}
-                  >
-                    <option value="REFILLABLE">Перезаправляемый</option>
-                    <option value="DISPOSABLE">Одноразовый</option>
-                  </select>
-                </label>
-                <label>
-                  Количество
-                  <input
-                    type="number"
-                    min={0}
-                    value={newQuantity}
-                    onChange={(e) => setNewQuantity(Number(e.target.value))}
-                  />
-                </label>
-                <label>
-                  Комментарий
-                  <textarea value={newComment} onChange={(e) => setNewComment(e.target.value)} />
-                </label>
-                <button type="submit">Добавить в остаток</button>
+                <div className="batch-selector-grid">
+                  {models.map((item) => (
+                    <button
+                      key={item.id}
+                      type="button"
+                      className={`batch-model-chip ${selectedBatchModelIds.includes(item.id) ? 'active' : ''}`}
+                      onClick={() => toggleBatchModel(item.id)}
+                    >
+                      <span>{item.name}</span>
+                      <small>{item.refillable ? 'Заправляемый' : 'Незаправляемый'}</small>
+                    </button>
+                  ))}
+                </div>
+
+                {activeBatchModel ? (
+                  <div className="batch-carousel">
+                    <div className="batch-carousel-header">
+                      <button
+                        type="button"
+                        className="ghost"
+                        onClick={() => setActiveBatchIndex((index) => Math.max(0, index - 1))}
+                        disabled={activeBatchIndex === 0}
+                      >
+                        {'<'}
+                      </button>
+                      <div>
+                        <strong>{activeBatchModel.name}</strong>
+                        <p className="table-muted">
+                          {activeBatchIndex + 1} из {selectedBatchModels.length} · {activeBatchModel.refillable ? 'Заправляемый' : 'Незаправляемый'} · минимум {activeBatchModel.minimumQuantity}
+                        </p>
+                      </div>
+                      <button
+                        type="button"
+                        className="ghost"
+                        onClick={() => setActiveBatchIndex((index) => Math.min(selectedBatchModels.length - 1, index + 1))}
+                        disabled={activeBatchIndex === selectedBatchModels.length - 1}
+                      >
+                        {'>'}
+                      </button>
+                    </div>
+                    <label>
+                      Количество
+                      <input
+                        type="number"
+                        min={0}
+                        value={activeBatchEntry?.quantity ?? 1}
+                        onChange={(e) => updateBatchEntry(activeBatchModel.id, { quantity: Number(e.target.value) })}
+                      />
+                    </label>
+                    <label>
+                      Комментарий
+                      <textarea
+                        value={activeBatchEntry?.comment ?? ''}
+                        onChange={(e) => updateBatchEntry(activeBatchModel.id, { comment: e.target.value })}
+                      />
+                    </label>
+                  </div>
+                ) : (
+                  <div className="empty-state">Выберите одну или несколько моделей, чтобы сформировать партию пополнения.</div>
+                )}
+
+                <button type="submit" disabled={selectedBatchModels.length === 0}>Добавить выбранные модели в остаток</button>
               </form>
 
               <section className="form-card">
                 <h3>Модели картриджей</h3>
                 <p className="form-help">
-                  Удаление доступно только если модель не используется в остатках и не назначена в точках замены.
+                  Здесь можно менять минимальный остаток и тип модели. Удаление доступно только если модель не используется.
                 </p>
-                <div className="department-mini-list">
+                <div className="model-catalog-grid">
                   {models.length === 0 && <div className="empty-state">Моделей пока нет.</div>}
                   {models.map((item) => (
-                    <article key={item.id} className="department-mini-item">
-                      <div>
-                        <strong>{item.name}</strong>
+                    <article key={item.id} className="model-catalog-card">
+                      <div className="model-catalog-head">
+                        <div>
+                          <strong>{item.name}</strong>
+                          <p className="table-muted">
+                            Готово {modelSummaryById[item.id]?.ready ?? 0} · Пустых {modelSummaryById[item.id]?.empty ?? 0} · Мин. {item.minimumQuantity}
+                          </p>
+                        </div>
+                        <span className={`status-badge ${item.refillable ? 'status-ready' : 'status-disposable'}`}>
+                          {item.refillable ? 'Заправляемый' : 'Одноразовый'}
+                        </span>
                       </div>
-                      <button type="button" className="ghost-button danger-button" onClick={() => onDeleteCartridgeModel(item.id, item.name)}>
-                        Удалить
-                      </button>
+                      <div className="model-edit-grid">
+                        <label>
+                          Название
+                          <input value={item.name} onChange={(e) => onChangeModelField(item.id, { name: e.target.value })} />
+                        </label>
+                        <label>
+                          Тип модели
+                          <select
+                            value={item.refillable ? 'REFILLABLE' : 'DISPOSABLE'}
+                            onChange={(e) => onChangeModelField(item.id, { refillable: e.target.value === 'REFILLABLE' })}
+                          >
+                            <option value="REFILLABLE">Заправляемый</option>
+                            <option value="DISPOSABLE">Незаправляемый</option>
+                          </select>
+                        </label>
+                        <label>
+                          Минимальный остаток
+                          <input
+                            type="number"
+                            min={0}
+                            value={item.minimumQuantity}
+                            onChange={(e) => onChangeModelField(item.id, { minimumQuantity: Number(e.target.value) })}
+                          />
+                        </label>
+                      </div>
+                      <div className="model-catalog-footer">
+                        <span className={balanceTone(modelSummaryById[item.id]?.balance ?? 0)}>
+                          {(modelSummaryById[item.id]?.balance ?? 0) < 0
+                            ? `Не хватает ${Math.abs(modelSummaryById[item.id]?.balance ?? 0)} шт.`
+                            : (modelSummaryById[item.id]?.balance ?? 0) === 0
+                              ? 'Ровно по минимуму'
+                              : `Излишек ${modelSummaryById[item.id]?.balance ?? 0} шт.`}
+                        </span>
+                      </div>
+                      <div className="table-actions model-catalog-actions">
+                        <button type="button" onClick={() => onSaveModelSettings(item)}>
+                          Сохранить
+                        </button>
+                        <button type="button" className="ghost danger-action" onClick={() => onDeleteCartridgeModel(item.id, item.name)}>
+                          Удалить
+                        </button>
+                      </div>
+                    </article>
+                  ))}
+                </div>
+              </section>
+            </div>
+
+            <div className="create-summary-grid">
+              <section className="form-card">
+                <h3>Заправляемые модели</h3>
+                <div className="department-mini-list">
+                  {refillableModelSummary.length === 0 && <div className="empty-state">Таких моделей пока нет.</div>}
+                  {refillableModelSummary.map((item) => (
+                    <article key={item.id} className="department-mini-card">
+                      <strong>{item.name}</strong>
+                      <p>Готово: {item.ready} · Пустых: {item.empty} · На заправке: {item.onRefill}</p>
+                      <p>Минимум: {item.minimumQuantity} · Точек замены: {item.assignedPoints}</p>
+                      <span className={balanceTone(item.balance)}>
+                        {item.balance < 0 ? `Не хватает ${Math.abs(item.balance)} шт.` : item.balance === 0 ? 'Ровно по минимуму' : `Излишек ${item.balance} шт.`}
+                      </span>
+                    </article>
+                  ))}
+                </div>
+              </section>
+
+              <section className="form-card">
+                <h3>Незаправляемые модели</h3>
+                <div className="department-mini-list">
+                  {disposableModelSummary.length === 0 && <div className="empty-state">Таких моделей пока нет.</div>}
+                  {disposableModelSummary.map((item) => (
+                    <article key={item.id} className="department-mini-card">
+                      <strong>{item.name}</strong>
+                      <p>Готово: {item.ready} · Пустых: {item.empty} · На заправке: {item.onRefill}</p>
+                      <p>Минимум: {item.minimumQuantity} · Точек замены: {item.assignedPoints}</p>
+                      <span className={balanceTone(item.balance)}>
+                        {item.balance < 0 ? `Не хватает ${Math.abs(item.balance)} шт.` : item.balance === 0 ? 'Ровно по минимуму' : `Излишек ${item.balance} шт.`}
+                      </span>
                     </article>
                   ))}
                 </div>
@@ -1619,24 +2198,17 @@ export default function App() {
                 <p>Режим: <strong>{selectedCartridgeRefillable ? 'Заправляемый' : 'Одноразовый'}</strong></p>
                 <p>Состояние: <strong>{selectedCartridgeEmpty ? 'Пустой' : 'Готов к установке'}</strong></p>
                 </div>
-                <label>
-                  Обращение
-                  <select
-                    value={selectedCartridgeRefillable ? 'REFILLABLE' : 'DISPOSABLE'}
-                    onChange={(e) => onChangeRefillable(e.target.value === 'REFILLABLE')}
-                  >
-                    <option value="REFILLABLE">Заправляется</option>
-                    <option value="DISPOSABLE">Не заправляется</option>
-                  </select>
-                </label>
                 <p className="detail-status-line">
                   Статус: <span className={`status-badge ${STATUS_TONES[selectedCartridge.status]}`}>{STATUS_LABELS[selectedCartridge.status]}</span>
                 </p>
                 <div className="detail-info-list">
                   <p>Количество: <strong>{selectedCartridge.quantity}</strong></p>
                   <p>Установлено: <strong>{selectedCartridge.installedQuantity ?? 0}</strong></p>
-                  <p>Заправок: <strong>{selectedCartridge.refillCount}</strong></p>
-                  <p>Последняя заправка: <strong>{selectedCartridge.lastRefillDate || '-'}</strong></p>
+                  {selectedCartridgeRefillable && <p>Заправок: <strong>{selectedCartridge.refillCount}</strong></p>}
+                  {selectedCartridgeRefillable && <p>Последняя заправка: <strong>{selectedCartridge.lastRefillDate || '-'}</strong></p>}
+                  {!selectedCartridgeRefillable && selectedCartridge.status === 'WRITTEN_OFF' && (
+                    <p>Списано за все время: <strong>{disposableWrittenOffByModel[selectedCartridge.cartridgeModelName] ?? 0}</strong></p>
+                  )}
                   <p>Комментарий: <strong>{selectedCartridge.comment || '-'}</strong></p>
                 </div>
               </div>
@@ -1644,38 +2216,20 @@ export default function App() {
               <div className="detail-card">
                 <h3>Действия</h3>
                 <div className="detail-actions">
-                  <button onClick={() => setDetailAction('adjust')}>Изменить количество</button>
-                  <button onClick={() => setDetailAction('send')} disabled={!selectedCartridgeRefillable || !selectedCartridgeEmpty}>Отправить на заправку</button>
-                  <button onClick={() => setDetailAction('return')}>Вернуть с заправки</button>
-                  <button onClick={() => setDetailAction('writeoff')}>Списать</button>
+                  {selectedCartridgeRefillable && selectedCartridge.status !== 'WRITTEN_OFF' && (
+                    <button onClick={() => setDetailAction('send')} disabled={!selectedCartridgeEmpty}>
+                      Отправить на заправку
+                    </button>
+                  )}
+                  {selectedCartridgeRefillable && selectedCartridge.status === 'ON_REFILL' && (
+                    <button onClick={() => setDetailAction('return')}>Вернуть с заправки</button>
+                  )}
+                  {selectedCartridge.status !== 'WRITTEN_OFF' && (
+                    <button onClick={() => setDetailAction('writeoff')}>Списать</button>
+                  )}
                 </div>
               </div>
             </div>
-
-            {detailAction === 'adjust' && (
-              <form onSubmit={onDetailAdjustQuantity} className="detail-form detail-card">
-                <h3>Изменить количество</h3>
-                <label>
-                  Количество
-                  <input
-                    type="number"
-                    min={0}
-                    value={detailQuantity}
-                    onChange={(e) => setDetailQuantity(Number(e.target.value))}
-                  />
-                </label>
-                <label>
-                  Комментарий
-                  <input value={detailComment} onChange={(e) => setDetailComment(e.target.value)} />
-                </label>
-                <div className="detail-form-actions">
-                  <button type="submit">Сохранить</button>
-                  <button type="button" className="ghost" onClick={() => setDetailAction(null)}>
-                    Отмена
-                  </button>
-                </div>
-              </form>
-            )}
 
             {detailAction === 'send' && (
               <form onSubmit={onDetailSendToRefill} className="detail-form detail-card">
@@ -1684,6 +2238,16 @@ export default function App() {
                 {selectedCartridgeRefillable && !selectedCartridgeEmpty && (
                   <p className="form-help danger-text">На заправку можно отправлять только пустой перезаправляемый картридж.</p>
                 )}
+                <label>
+                  Количество
+                  <input
+                    type="number"
+                    min={1}
+                    max={selectedCartridge.quantity}
+                    value={detailQuantity}
+                    onChange={(e) => setDetailQuantity(Number(e.target.value))}
+                  />
+                </label>
                 <label>
                   Дата
                   <input type="date" value={detailDateValue} onChange={(e) => setDetailDateValue(e.target.value)} />
@@ -1697,7 +2261,7 @@ export default function App() {
                   <input value={detailComment} onChange={(e) => setDetailComment(e.target.value)} />
                 </label>
                 <div className="detail-form-actions">
-                  <button type="submit" disabled={!selectedCartridgeRefillable || !selectedCartridgeEmpty}>Подтвердить</button>
+                  <button type="submit" disabled={!selectedCartridgeRefillable || !selectedCartridgeEmpty || selectedCartridge.quantity < 1}>Подтвердить</button>
                   <button type="button" className="ghost" onClick={() => setDetailAction(null)}>
                     Отмена
                   </button>
@@ -1708,6 +2272,16 @@ export default function App() {
             {detailAction === 'return' && (
               <form onSubmit={onDetailReturnFromRefill} className="detail-form detail-card">
                 <h3>Вернуть с заправки</h3>
+                <label>
+                  Количество
+                  <input
+                    type="number"
+                    min={1}
+                    max={selectedCartridge.quantity}
+                    value={detailQuantity}
+                    onChange={(e) => setDetailQuantity(Number(e.target.value))}
+                  />
+                </label>
                 <label>
                   Дата
                   <input type="date" value={detailDateValue} onChange={(e) => setDetailDateValue(e.target.value)} />
@@ -1744,6 +2318,29 @@ export default function App() {
                 </div>
               </form>
             )}
+          </div>
+        </section>
+      )}
+
+      {deleteTarget && (
+        <section className="detail-backdrop" onClick={() => setDeleteTarget(null)}>
+          <div className="detail-panel confirm-panel" onClick={(e) => e.stopPropagation()}>
+            <div className="detail-header">
+              <div>
+                <p className="eyebrow">Подтверждение</p>
+                <h3>Удаление</h3>
+                <p className="table-hint">Удалить: {deleteTarget.label}</p>
+              </div>
+            </div>
+            <p className="table-hint">Это действие нельзя отменить.</p>
+            <div className="detail-form-actions">
+              <button type="button" className="danger-action" onClick={confirmDeleteTarget}>
+                Удалить
+              </button>
+              <button type="button" className="ghost" onClick={() => setDeleteTarget(null)}>
+                Отмена
+              </button>
+            </div>
           </div>
         </section>
       )}

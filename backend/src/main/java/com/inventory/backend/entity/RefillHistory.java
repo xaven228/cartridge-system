@@ -36,6 +36,9 @@ public class RefillHistory extends BaseEntity {
     @Column(nullable = false)
     private RefillStatus status;
 
+    @Column(nullable = false)
+    private Integer quantity;
+
     @Column(length = 1000)
     private String comment;
 

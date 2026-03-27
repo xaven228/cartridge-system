@@ -109,6 +109,15 @@ public class CartridgeController {
         return cartridgeService.writeOff(id, comment);
     }
 
+    @PostMapping("/{id}/mark-empty")
+    public CartridgeResponse markInstalledAsEmpty(
+            @PathVariable Long id,
+            @RequestBody(required = false) Map<String, String> body
+    ) {
+        String comment = body != null ? body.get("comment") : null;
+        return cartridgeService.markInstalledAsEmpty(id, comment);
+    }
+
     @DeleteMapping("/{id}")
     public void delete(@PathVariable Long id) {
         cartridgeService.delete(id);

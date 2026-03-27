@@ -9,11 +9,14 @@ import com.inventory.backend.entity.CartridgeStatus;
 import com.inventory.backend.entity.Department;
 import com.inventory.backend.entity.Printer;
 import com.inventory.backend.entity.PrinterInstallation;
+import com.inventory.backend.entity.PrinterSlot;
+import com.inventory.backend.entity.PrinterType;
 import com.inventory.backend.repository.CartridgeModelRepository;
 import com.inventory.backend.repository.CartridgeRepository;
 import com.inventory.backend.repository.DepartmentRepository;
 import com.inventory.backend.repository.PrinterInstallationRepository;
 import com.inventory.backend.repository.PrinterRepository;
+import com.inventory.backend.repository.PrinterSlotRepository;
 import com.inventory.backend.repository.RefillHistoryRepository;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -29,6 +32,7 @@ import java.util.concurrent.atomic.AtomicLong;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -46,6 +50,9 @@ class CartridgeServiceTest {
 
     @Mock
     private PrinterRepository printerRepository;
+
+    @Mock
+    private PrinterSlotRepository printerSlotRepository;
 
     @Mock
     private PrinterInstallationRepository printerInstallationRepository;
@@ -96,6 +103,13 @@ class CartridgeServiceTest {
 
         when(cartridgeModelRepository.findById(model.getId())).thenReturn(Optional.of(model));
         when(departmentRepository.findByNameIgnoreCase("Склад")).thenReturn(Optional.of(department));
+        when(cartridgeRepository.findCompatibleStockRows(
+                department.getId(),
+                model.getId(),
+                CartridgeStatus.IN_STOCK,
+                true,
+                false
+        )).thenReturn(List.of());
         when(cartridgeRepository.existsByInventoryCodeIgnoreCase(any())).thenReturn(false);
         when(cartridgeRepository.save(any(Cartridge.class))).thenReturn(saved);
         when(printerInstallationRepository.findByCartridgeId(saved.getId())).thenReturn(java.util.List.of());
@@ -109,6 +123,58 @@ class CartridgeServiceTest {
         assertThat(response.getInventoryCode()).isEqualTo("CRT-A1B2C3D4");
         assertThat(response.getDepartmentId()).isEqualTo(20L);
         assertThat(response.getCartridgeModelId()).isEqualTo(10L);
+    }
+
+    @Test
+    void createShouldMergeIntoExistingStockRowWhenInventoryCodeNotSpecified() {
+        CartridgeModel model = CartridgeModel.builder()
+                .id(10L)
+                .name("TK-1120")
+                .build();
+
+        Department department = Department.builder()
+                .id(20L)
+                .name("Склад")
+                .build();
+
+        Cartridge existingStock = Cartridge.builder()
+                .id(100L)
+                .inventoryCode("CRT-STOCK")
+                .cartridgeModel(model)
+                .department(department)
+                .quantity(3)
+                .refillable(true)
+                .empty(false)
+                .status(CartridgeStatus.IN_STOCK)
+                .refillCount(0)
+                .comment("")
+                .build();
+
+        CreateCartridgeRequest request = new CreateCartridgeRequest();
+        request.setCartridgeModelId(model.getId());
+        request.setQuantity(2);
+        request.setRefillable(true);
+        request.setComment("new batch");
+
+        when(cartridgeModelRepository.findById(model.getId())).thenReturn(Optional.of(model));
+        when(departmentRepository.findByNameIgnoreCase("Склад")).thenReturn(Optional.of(department));
+        when(cartridgeRepository.findCompatibleStockRows(
+                department.getId(),
+                model.getId(),
+                CartridgeStatus.IN_STOCK,
+                true,
+                false
+        )).thenReturn(List.of(existingStock));
+        when(cartridgeRepository.save(existingStock)).thenReturn(existingStock);
+        when(printerInstallationRepository.findByCartridgeId(existingStock.getId())).thenReturn(List.of());
+
+        CartridgeResponse response = cartridgeService.create(request);
+
+        assertThat(existingStock.getQuantity()).isEqualTo(5);
+        assertThat(existingStock.getComment()).isEqualTo("new batch");
+        assertThat(response.getId()).isEqualTo(100L);
+        assertThat(response.getQuantity()).isEqualTo(5);
+        verify(cartridgeRepository, never()).existsByInventoryCodeIgnoreCase(any());
     }
 
     @Test
@@ -138,19 +204,28 @@ class CartridgeServiceTest {
         Printer printer = Printer.builder()
                 .id(30L)
                 .name("IT / Точка 1")
+                .printerType(PrinterType.MONOCHROME)
+                .department(department)
+                .slots(List.of())
+                .build();
+
+        PrinterSlot printerSlot = PrinterSlot.builder()
+                .id(31L)
+                .name("Основной")
+                .printer(printer)
                 .cartridgeModel(model)
                 .build();
 
         InstallCartridgeRequest request = new InstallCartridgeRequest();
-        request.setPrinterId(printer.getId());
+        request.setPrinterId(printerSlot.getId());
         request.setQuantity(1);
         request.setComment("install");
 
         AtomicLong generatedId = new AtomicLong(500L);
 
         when(cartridgeRepository.findById(stockCartridge.getId())).thenReturn(Optional.of(stockCartridge));
-        when(printerRepository.findById(printer.getId())).thenReturn(Optional.of(printer));
-        when(printerInstallationRepository.findFirstByPrinterIdAndQuantityGreaterThan(printer.getId(), 0))
+        when(printerSlotRepository.findById(printerSlot.getId())).thenReturn(Optional.of(printerSlot));
+        when(printerInstallationRepository.findFirstByPrinterSlotIdAndQuantityGreaterThan(printerSlot.getId(), 0))
                 .thenReturn(Optional.empty());
         when(cartridgeRepository.existsByInventoryCodeIgnoreCase(any())).thenReturn(false);
         when(cartridgeRepository.save(any(Cartridge.class))).thenAnswer(invocation -> {
@@ -161,10 +236,9 @@ class CartridgeServiceTest {
             return saved;
         });
         when(printerInstallationRepository.save(any(PrinterInstallation.class))).thenAnswer(invocation -> invocation.getArgument(0));
-        when(printerRepository.save(any(Printer.class))).thenAnswer(invocation -> invocation.getArgument(0));
         when(printerInstallationRepository.findByCartridgeId(eq(500L))).thenReturn(List.of(
                 PrinterInstallation.builder()
-                        .printer(printer)
+                        .printerSlot(printerSlot)
                         .cartridge(stockCartridge)
                         .quantity(1)
                         .build()

@@ -38,6 +38,7 @@ public class RefillHistoryService {
                 .sentAt(refillHistory.getSentAt())
                 .returnedAt(refillHistory.getReturnedAt())
                 .status(refillHistory.getStatus())
+                .quantity(refillHistory.getQuantity())
                 .comment(refillHistory.getComment())
                 .createdBy(refillHistory.getCreatedBy())
                 .createdAt(refillHistory.getCreatedAt())

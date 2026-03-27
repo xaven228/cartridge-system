@@ -16,6 +16,7 @@ import com.inventory.backend.entity.CartridgeStatus;
 import com.inventory.backend.entity.Department;
 import com.inventory.backend.entity.Printer;
 import com.inventory.backend.entity.PrinterInstallation;
+import com.inventory.backend.entity.PrinterSlot;
 import com.inventory.backend.entity.RefillHistory;
 import com.inventory.backend.entity.RefillStatus;
 import com.inventory.backend.exception.BadRequestException;
@@ -26,6 +27,7 @@ import com.inventory.backend.repository.CartridgeRepository;
 import com.inventory.backend.repository.DepartmentRepository;
 import com.inventory.backend.repository.PrinterInstallationRepository;
 import com.inventory.backend.repository.PrinterRepository;
+import com.inventory.backend.repository.PrinterSlotRepository;
 import com.inventory.backend.repository.RefillHistoryRepository;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
@@ -40,11 +42,13 @@ import java.util.UUID;
 @RequiredArgsConstructor
 public class CartridgeService {
     private static final String STOCK_DEPARTMENT_NAME = "Склад";
+    private static final String DISPOSABLE_WRITE_OFF_COMMENT = "Израсходованы";
 
     private final CartridgeRepository cartridgeRepository;
     private final CartridgeModelRepository cartridgeModelRepository;
     private final DepartmentRepository departmentRepository;
     private final PrinterRepository printerRepository;
+    private final PrinterSlotRepository printerSlotRepository;
     private final PrinterInstallationRepository printerInstallationRepository;
     private final RefillHistoryRepository refillHistoryRepository;
     private final ActionLogService actionLogService;
@@ -81,6 +85,27 @@ public class CartridgeService {
                 .orElseThrow(() -> new NotFoundException("Отдел не найден: " + request.getDepartmentId()))
                 : getOrCreateStockDepartment();
 
+        Boolean refillable = request.getRefillable() != null ? request.getRefillable() : cartridgeModel.getRefillable();
+        CartridgeStatus targetStatus = request.getStatus() != null ? request.getStatus() : CartridgeStatus.IN_STOCK;
+        Cartridge existingStock = findCompatibleStockForIncrement(request, cartridgeModel, department, targetStatus, refillable);
+        if (existingStock != null) {
+            existingStock.setQuantity(existingStock.getQuantity() + request.getQuantity());
+            if ((existingStock.getComment() == null || existingStock.getComment().isBlank())
+                    && request.getComment() != null && !request.getComment().isBlank()) {
+                existingStock.setComment(request.getComment());
+            }
+
+            Cartridge saved = cartridgeRepository.save(existingStock);
+            actionLogService.log(
+                    ActionLogType.CARTRIDGE_CREATED,
+                    saved.getCartridgeModel().getName(),
+                    "Приход в остаток: " + request.getQuantity() + " шт., тип: "
+                            + (Boolean.TRUE.equals(saved.getRefillable()) ? "перезаправляемый" : "одноразовый"),
+                    "Система"
+            );
+            return toResponse(saved);
+        }
+
         String inventoryCode = resolveInventoryCode(request.getInventoryCode());
 
         Cartridge cartridge = Cartridge.builder()
@@ -88,9 +113,9 @@ public class CartridgeService {
                 .cartridgeModel(cartridgeModel)
                 .department(department)
                 .quantity(request.getQuantity())
-                .refillable(request.getRefillable())
+                .refillable(refillable)
                 .empty(false)
-                .status(request.getStatus() != null ? request.getStatus() : CartridgeStatus.IN_STOCK)
+                .status(targetStatus)
                 .refillCount(0)
                 .comment(request.getComment())
                 .build();
@@ -104,6 +129,29 @@ public class CartridgeService {
                 "Система"
         );
         return toResponse(saved);
+    }
+
+    private Cartridge findCompatibleStockForIncrement(
+            CreateCartridgeRequest request,
+            CartridgeModel cartridgeModel,
+            Department department,
+            CartridgeStatus targetStatus,
+            Boolean refillable
+    ) {
+        if (request.getInventoryCode() != null && !request.getInventoryCode().isBlank()) {
+            return null;
+        }
+        if (targetStatus != CartridgeStatus.IN_STOCK) {
+            return null;
+        }
+
+        return findCompatibleStockRow(
+                department.getId(),
+                cartridgeModel.getId(),
+                refillable,
+                false,
+                null
+        );
     }
 
     @Transactional
@@ -154,26 +202,44 @@ public class CartridgeService {
             throw new ConflictException("На заправку можно отправлять только пустой картридж");
         }
 
-        cartridge.setStatus(CartridgeStatus.ON_REFILL);
+        if (request.getQuantity() > cartridge.getQuantity()) {
+            throw new ConflictException("Нельзя отправить на заправку больше, чем есть в остатке");
+        }
+
+        Cartridge refillBatch;
+        if (request.getQuantity().equals(cartridge.getQuantity())) {
+            cartridge.setStatus(CartridgeStatus.ON_REFILL);
+            refillBatch = cartridgeRepository.save(cartridge);
+        } else {
+            cartridge.setQuantity(cartridge.getQuantity() - request.getQuantity());
+            cartridgeRepository.save(cartridge);
+            refillBatch = cartridgeRepository.save(createBatchCartridge(
+                    cartridge,
+                    request.getQuantity(),
+                    CartridgeStatus.ON_REFILL,
+                    true,
+                    request.getComment()
+            ));
+        }
 
         RefillHistory refillHistory = RefillHistory.builder()
-                .cartridge(cartridge)
+                .cartridge(refillBatch)
                 .sentAt(request.getSentAt())
                 .status(RefillStatus.SENT)
+                .quantity(request.getQuantity())
                 .comment(request.getComment())
                 .createdBy(request.getCreatedBy())
                 .build();
 
         refillHistoryRepository.save(refillHistory);
-        Cartridge saved = cartridgeRepository.save(cartridge);
         actionLogService.log(
                 ActionLogType.CARTRIDGE_SENT_TO_REFILL,
-                saved.getCartridgeModel().getName(),
-                "Отправлен на заправку. Комментарий: " + safeText(request.getComment()),
+                refillBatch.getCartridgeModel().getName(),
+                "Отправлен на заправку: " + request.getQuantity() + " шт. Комментарий: " + safeText(request.getComment()),
                 request.getCreatedBy()
         );
 
-        return toResponse(saved);
+        return toResponse(refillBatch);
     }
 
     @Transactional
@@ -184,37 +250,30 @@ public class CartridgeService {
             throw new ConflictException("Картридж не находится на заправке");
         }
 
+        if (request.getQuantity() > cartridge.getQuantity()) {
+            throw new ConflictException("Нельзя вернуть с заправки больше, чем находится в партии");
+        }
+
         RefillHistory lastSentRecord = refillHistoryRepository
                 .findFirstByCartridgeIdAndStatusOrderByIdDesc(id, RefillStatus.SENT)
                 .orElseThrow(() -> new NotFoundException("Не найдена запись об отправке на заправку"));
 
-        lastSentRecord.setReturnedAt(request.getReturnedAt());
-        lastSentRecord.setStatus(RefillStatus.RETURNED);
+        RefillHistory returnRecord = RefillHistory.builder()
+                .cartridge(cartridge)
+                .sentAt(lastSentRecord.getSentAt())
+                .returnedAt(request.getReturnedAt())
+                .status(RefillStatus.RETURNED)
+                .quantity(request.getQuantity())
+                .comment(mergeComments(lastSentRecord.getComment(), request.getComment()))
+                .createdBy(request.getCreatedBy())
+                .build();
+        refillHistoryRepository.save(returnRecord);
 
-        String oldComment = lastSentRecord.getComment();
-        String newComment = request.getComment();
-
-        if (newComment != null && !newComment.isBlank()) {
-            if (oldComment == null || oldComment.isBlank()) {
-                lastSentRecord.setComment(newComment);
-            } else {
-                lastSentRecord.setComment(oldComment + " | " + newComment);
-            }
-        }
-
-        lastSentRecord.setCreatedBy(request.getCreatedBy());
-        refillHistoryRepository.save(lastSentRecord);
-
-        cartridge.setStatus(CartridgeStatus.IN_STOCK);
-        cartridge.setEmpty(false);
-        cartridge.setRefillCount(cartridge.getRefillCount() + 1);
-        cartridge.setLastRefillDate(request.getReturnedAt());
-
-        Cartridge saved = cartridgeRepository.save(cartridge);
+        Cartridge saved = moveReturnedBatchToStock(cartridge, request);
         actionLogService.log(
                 ActionLogType.CARTRIDGE_RETURNED_FROM_REFILL,
                 saved.getCartridgeModel().getName(),
-                "Возвращен с заправки. Остаток: " + saved.getQuantity() + " шт.",
+                "Возвращен с заправки: " + request.getQuantity() + " шт. Остаток: " + saved.getQuantity() + " шт.",
                 request.getCreatedBy()
         );
         return toResponse(saved);
@@ -237,10 +296,11 @@ public class CartridgeService {
     @Transactional
     public CartridgeResponse installToPrinter(Long id, InstallCartridgeRequest request) {
         Cartridge cartridge = getCartridgeEntity(id);
-        Printer printer = getPrinterEntity(request.getPrinterId());
+        PrinterSlot slot = getPrinterSlotEntity(request.getPrinterId());
+        Printer printer = slot.getPrinter();
 
-        if (printer.getCartridgeModel() != null
-                && !printer.getCartridgeModel().getId().equals(cartridge.getCartridgeModel().getId())) {
+        if (slot.getCartridgeModel() != null
+                && !slot.getCartridgeModel().getId().equals(cartridge.getCartridgeModel().getId())) {
             throw new ConflictException("Для этого принтера назначен другой тип картриджа");
         }
 
@@ -260,7 +320,7 @@ public class CartridgeService {
             throw new ConflictException("На складе недостаточно картриджей для установки");
         }
 
-        if (printerInstallationRepository.findFirstByPrinterIdAndQuantityGreaterThan(printer.getId(), 0).isPresent()) {
+        if (printerInstallationRepository.findFirstByPrinterSlotIdAndQuantityGreaterThan(slot.getId(), 0).isPresent()) {
             throw new ConflictException("В этой точке замены уже установлен картридж");
         }
 
@@ -280,15 +340,15 @@ public class CartridgeService {
         }
 
         PrinterInstallation installation = PrinterInstallation.builder()
-                .printer(printer)
+                .printerSlot(slot)
                 .cartridge(installationCartridge)
                 .quantity(request.getQuantity())
                 .build();
         printerInstallationRepository.save(installation);
 
-        printer.setPreviousReplacementDate(printer.getLastReplacementDate());
-        printer.setLastReplacementDate(LocalDate.now());
-        printerRepository.save(printer);
+        slot.setPreviousReplacementDate(slot.getLastReplacementDate());
+        slot.setLastReplacementDate(LocalDate.now());
+        printerSlotRepository.save(slot);
 
         Cartridge saved = installationCartridge;
         actionLogService.log(
@@ -303,43 +363,48 @@ public class CartridgeService {
     @Transactional
     public CartridgeResponse replaceInPrinter(Long newCartridgeId, ReplaceCartridgeRequest request) {
         Cartridge newCartridge = getCartridgeEntity(newCartridgeId);
-        Printer printer = getPrinterEntity(request.getPrinterId());
+        PrinterSlot slot = getPrinterSlotEntity(request.getPrinterId());
 
         PrinterInstallation currentInstallation = printerInstallationRepository
-                .findFirstByPrinterIdAndQuantityGreaterThan(printer.getId(), 0)
+                .findFirstByPrinterSlotIdAndQuantityGreaterThan(slot.getId(), 0)
                 .orElse(null);
 
         if (currentInstallation != null) {
             Cartridge installedCartridge = currentInstallation.getCartridge();
-
-            String removedOutcome = request.getRemovedOutcome().trim().toUpperCase(Locale.ROOT);
-            switch (removedOutcome) {
-                case "STOCK" -> removeFromPrinter(installedCartridge.getId(),
-                        buildRemoveRequest(printer.getId(), true, request.getComment()));
-                case "REFILL" -> {
-                    if (Boolean.FALSE.equals(installedCartridge.getRefillable())) {
-                        throw new ConflictException("Старый картридж помечен как одноразовый и не может быть отправлен на заправку");
+            if (Boolean.FALSE.equals(installedCartridge.getRefillable())) {
+                removeFromPrinter(
+                        installedCartridge.getId(),
+                        buildRemoveRequest(slot.getId(), false, defaultDisposableWriteOffComment(request.getComment()))
+                );
+            } else {
+                String removedOutcome = request.getRemovedOutcome().trim().toUpperCase(Locale.ROOT);
+                switch (removedOutcome) {
+                    case "STOCK" -> removeFromPrinter(installedCartridge.getId(),
+                            buildRemoveRequest(slot.getId(), true, request.getComment()));
+                    case "REFILL" -> {
+                        removeFromPrinter(installedCartridge.getId(),
+                                buildRemoveRequest(slot.getId(), true, request.getComment()));
+                        sendToRefill(installedCartridge.getId(), buildSendToRefillRequest(request));
                     }
-                    removeFromPrinter(installedCartridge.getId(),
-                            buildRemoveRequest(printer.getId(), true, request.getComment()));
+                    case "WRITE_OFF" -> {
+                        removeFromPrinter(installedCartridge.getId(),
+                                buildRemoveRequest(slot.getId(), false, request.getComment()));
+                        writeOff(installedCartridge.getId(), request.getComment());
+                    }
+                    default -> throw new BadRequestException("Неизвестный сценарий замены: " + request.getRemovedOutcome());
                 }
-                case "WRITE_OFF" -> {
-                    removeFromPrinter(installedCartridge.getId(),
-                            buildRemoveRequest(printer.getId(), false, request.getComment()));
-                    writeOff(installedCartridge.getId(), request.getComment());
-                }
-                default -> throw new BadRequestException("Неизвестный сценарий замены: " + request.getRemovedOutcome());
             }
         }
 
-        return installToPrinter(newCartridgeId, buildInstallRequest(printer.getId(), request.getComment()));
+        return installToPrinter(newCartridgeId, buildInstallRequest(slot.getId(), request.getComment()));
     }
 
     @Transactional
     public CartridgeResponse removeFromPrinter(Long id, RemoveCartridgeInstallationRequest request) {
         Cartridge cartridge = getCartridgeEntity(id);
-        Printer printer = getPrinterEntity(request.getPrinterId());
-        PrinterInstallation installation = printerInstallationRepository.findByCartridgeIdAndPrinterId(id, printer.getId())
+        PrinterSlot slot = getPrinterSlotEntity(request.getPrinterId());
+        Printer printer = slot.getPrinter();
+        PrinterInstallation installation = printerInstallationRepository.findByCartridgeIdAndPrinterSlotId(id, slot.getId())
                 .orElseThrow(() -> new NotFoundException("Для этого картриджа нет установки в выбранный принтер"));
         int remainingInstalledQuantity = getInstalledQuantity(id) - request.getQuantity();
 
@@ -354,20 +419,46 @@ public class CartridgeService {
             printerInstallationRepository.save(installation);
         }
 
-        boolean returnToStock = !Boolean.FALSE.equals(request.getReturnToStock());
+        boolean disposable = Boolean.FALSE.equals(cartridge.getRefillable());
+        boolean returnToStock = !Boolean.FALSE.equals(request.getReturnToStock()) && !disposable;
+        String effectiveComment = disposable
+                ? defaultDisposableWriteOffComment(request.getComment())
+                : request.getComment();
         if (returnToStock) {
+            boolean emptyStock = Boolean.TRUE.equals(cartridge.getRefillable());
+            if (remainingInstalledQuantity <= 0) {
+                Cartridge saved = moveQuantityToStock(
+                        cartridge,
+                        request.getQuantity(),
+                        emptyStock,
+                        effectiveComment,
+                        null,
+                        false
+                );
+                actionLogService.log(
+                        ActionLogType.CARTRIDGE_REMOVED,
+                        saved.getCartridgeModel().getName(),
+                        "Снят с точки \"" + printer.getName() + "\". "
+                                + (emptyStock ? "Возвращен в остаток как пустой." : "Возвращен в остаток."),
+                        "Система"
+                );
+                if (!saved.getId().equals(cartridge.getId())) {
+                    cartridgeRepository.delete(cartridge);
+                }
+                return toResponse(saved);
+            }
+
             cartridge.setQuantity(cartridge.getQuantity() + request.getQuantity());
             cartridge.setStatus(CartridgeStatus.IN_STOCK);
-            if (Boolean.TRUE.equals(cartridge.getRefillable())) {
-                cartridge.setEmpty(true);
-            }
+            cartridge.setEmpty(emptyStock);
         } else if (remainingInstalledQuantity <= 0 && cartridge.getQuantity() == 0) {
             cartridge.setStatus(CartridgeStatus.WRITTEN_OFF);
+            cartridge.setQuantity(0);
             cartridge.setEmpty(false);
         }
 
-        if (request.getComment() != null && !request.getComment().isBlank()) {
-            cartridge.setComment(request.getComment());
+        if (effectiveComment != null && !effectiveComment.isBlank()) {
+            cartridge.setComment(effectiveComment);
         }
 
         Cartridge saved = cartridgeRepository.save(cartridge);
@@ -377,7 +468,7 @@ public class CartridgeService {
                 "Снят с точки \"" + printer.getName() + "\". "
                         + (returnToStock
                         ? (Boolean.TRUE.equals(saved.getRefillable()) ? "Возвращен в остаток как пустой." : "Возвращен в остаток.")
-                        : "Снят без возврата в остаток."),
+                        : (disposable ? "Списан как израсходованный." : "Снят без возврата в остаток.")),
                 "Система"
         );
         return toResponse(saved);
@@ -394,18 +485,52 @@ public class CartridgeService {
         cartridge.setStatus(CartridgeStatus.WRITTEN_OFF);
         cartridge.setQuantity(0);
 
-        if (comment != null && !comment.isBlank()) {
-            cartridge.setComment(comment);
+        String effectiveComment = Boolean.FALSE.equals(cartridge.getRefillable())
+                ? defaultDisposableWriteOffComment(comment)
+                : comment;
+        if (effectiveComment != null && !effectiveComment.isBlank()) {
+            cartridge.setComment(effectiveComment);
         }
 
         Cartridge saved = cartridgeRepository.save(cartridge);
         actionLogService.log(
                 ActionLogType.CARTRIDGE_WRITTEN_OFF,
                 saved.getCartridgeModel().getName(),
-                "Списан. Комментарий: " + safeText(comment),
+                "Списан. Комментарий: " + safeText(effectiveComment),
                 "Система"
         );
         return toResponse(saved);
+    }
+
+    @Transactional
+    public CartridgeResponse markInstalledAsEmpty(Long id, String comment) {
+        Cartridge cartridge = getCartridgeEntity(id);
+
+        if (cartridge.getStatus() == CartridgeStatus.ON_REFILL || cartridge.getStatus() == CartridgeStatus.WRITTEN_OFF) {
+            throw new ConflictException("Нельзя пометить пустым картридж в текущем статусе");
+        }
+
+        if (getInstalledQuantity(id) <= 0) {
+            throw new ConflictException("Пометить пустым можно только установленный картридж");
+        }
+
+        cartridge.setEmpty(true);
+        if (comment != null && !comment.isBlank()) {
+            cartridge.setComment(comment);
+        }
+
+        Cartridge saved = cartridgeRepository.save(cartridge);
+        actionLogService.log(
+                ActionLogType.CARTRIDGE_MARKED_EMPTY,
+                saved.getCartridgeModel().getName(),
+                "Помечен как пустой. Комментарий: " + safeText(comment),
+                "Система"
+        );
+        return toResponse(saved);
+    }
+
+    private String defaultDisposableWriteOffComment(String comment) {
+        return (comment == null || comment.isBlank()) ? DISPOSABLE_WRITE_OFF_COMMENT : comment;
     }
 
     @Transactional
@@ -471,8 +596,142 @@ public class CartridgeService {
         SendToRefillRequest request = new SendToRefillRequest();
         request.setSentAt(source.getActionDate() != null ? source.getActionDate() : LocalDate.now());
         request.setCreatedBy(source.getCreatedBy());
+        request.setQuantity(1);
         request.setComment(source.getComment());
         return request;
+    }
+
+    private Cartridge moveReturnedBatchToStock(Cartridge refillBatch, ReturnFromRefillRequest request) {
+        int totalInBatch = refillBatch.getQuantity();
+        if (request.getQuantity().equals(totalInBatch)) {
+            Cartridge saved = moveQuantityToStock(
+                    refillBatch,
+                    request.getQuantity(),
+                    false,
+                    request.getComment(),
+                    request.getReturnedAt(),
+                    true
+            );
+            if (!saved.getId().equals(refillBatch.getId())) {
+                cartridgeRepository.delete(refillBatch);
+            }
+            return saved;
+        }
+
+        refillBatch.setQuantity(totalInBatch - request.getQuantity());
+        cartridgeRepository.save(refillBatch);
+        return moveQuantityToStock(
+                createBatchCartridge(
+                        refillBatch,
+                        request.getQuantity(),
+                        CartridgeStatus.IN_STOCK,
+                        false,
+                        request.getComment()
+                ),
+                request.getQuantity(),
+                false,
+                request.getComment(),
+                request.getReturnedAt(),
+                true
+        );
+    }
+
+    private Cartridge moveQuantityToStock(
+            Cartridge source,
+            int quantity,
+            boolean empty,
+            String comment,
+            LocalDate lastRefillDate,
+            boolean incrementRefillCount
+    ) {
+        Cartridge existingStock = findCompatibleStockRow(
+                source.getDepartment().getId(),
+                source.getCartridgeModel().getId(),
+                source.getRefillable(),
+                empty,
+                source.getId()
+        );
+
+        if (existingStock != null) {
+            existingStock.setQuantity(existingStock.getQuantity() + quantity);
+            existingStock.setStatus(CartridgeStatus.IN_STOCK);
+            existingStock.setEmpty(empty);
+            if (lastRefillDate != null) {
+                existingStock.setLastRefillDate(lastRefillDate);
+            }
+            if (incrementRefillCount) {
+                existingStock.setRefillCount(Math.max(existingStock.getRefillCount(), source.getRefillCount() + 1));
+            }
+            if ((existingStock.getComment() == null || existingStock.getComment().isBlank())
+                    && comment != null && !comment.isBlank()) {
+                existingStock.setComment(comment);
+            }
+            return cartridgeRepository.save(existingStock);
+        }
+
+        source.setQuantity(quantity);
+        source.setStatus(CartridgeStatus.IN_STOCK);
+        source.setEmpty(empty);
+        if (lastRefillDate != null) {
+            source.setLastRefillDate(lastRefillDate);
+        }
+        if (incrementRefillCount) {
+            source.setRefillCount(source.getRefillCount() + 1);
+        }
+        if (comment != null && !comment.isBlank()) {
+            source.setComment(comment);
+        }
+        return cartridgeRepository.save(source);
+    }
+
+    private Cartridge findCompatibleStockRow(
+            Long departmentId,
+            Long cartridgeModelId,
+            Boolean refillable,
+            boolean empty,
+            Long excludeId
+    ) {
+        return cartridgeRepository.findCompatibleStockRows(
+                        departmentId,
+                        cartridgeModelId,
+                        CartridgeStatus.IN_STOCK,
+                        refillable,
+                        empty
+                ).stream()
+                .filter(cartridge -> excludeId == null || !cartridge.getId().equals(excludeId))
+                .findFirst()
+                .orElse(null);
+    }
+
+    private Cartridge createBatchCartridge(
+            Cartridge source,
+            int quantity,
+            CartridgeStatus status,
+            boolean empty,
+            String comment
+    ) {
+        return Cartridge.builder()
+                .inventoryCode(resolveInventoryCode(null))
+                .cartridgeModel(source.getCartridgeModel())
+                .department(source.getDepartment())
+                .quantity(quantity)
+                .refillable(source.getRefillable())
+                .empty(empty)
+                .status(status)
+                .refillCount(source.getRefillCount())
+                .lastRefillDate(source.getLastRefillDate())
+                .comment(comment != null && !comment.isBlank() ? comment : source.getComment())
+                .build();
+    }
+
+    private String mergeComments(String oldComment, String newComment) {
+        if (newComment == null || newComment.isBlank()) {
+            return oldComment;
+        }
+        if (oldComment == null || oldComment.isBlank()) {
+            return newComment;
+        }
+        return oldComment + " | " + newComment;
     }
 
     private String resolveInventoryCode(String requestedCode) {
@@ -537,9 +796,9 @@ public class CartridgeService {
                         .build()));
     }
 
-    private Printer getPrinterEntity(Long printerId) {
-        return printerRepository.findById(printerId)
-                .orElseThrow(() -> new NotFoundException("Принтер не найден: " + printerId));
+    private PrinterSlot getPrinterSlotEntity(Long printerSlotId) {
+        return printerSlotRepository.findById(printerSlotId)
+                .orElseThrow(() -> new NotFoundException("Слот принтера не найден: " + printerSlotId));
     }
 
     private int getInstalledQuantity(Long cartridgeId) {

@@ -44,6 +44,10 @@ public class CartridgeModel extends BaseEntity {
     @Column(name = "refillable", nullable = false)
     private Boolean refillable = true;
 
+    @Builder.Default
+    @Column(name = "minimum_quantity", nullable = false)
+    private Integer minimumQuantity = 0;
+
     @JsonIgnore
     @OneToMany(mappedBy = "cartridgeModel")
     @Builder.Default

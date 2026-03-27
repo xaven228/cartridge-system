@@ -30,8 +30,8 @@ public class PrinterInstallation extends BaseEntity {
     private Long id;
 
     @ManyToOne(fetch = FetchType.LAZY)
-    @JoinColumn(name = "printer_id", nullable = false)
-    private Printer printer;
+    @JoinColumn(name = "printer_slot_id", nullable = false)
+    private PrinterSlot printerSlot;
 
     @ManyToOne(fetch = FetchType.LAZY)
     @JoinColumn(name = "cartridge_id", nullable = false)

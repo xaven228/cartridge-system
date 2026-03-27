@@ -21,7 +21,6 @@ public class CreateCartridgeRequest {
     @Min(0)
     private Integer quantity;
 
-    @NotNull
     private Boolean refillable;
 
     private CartridgeStatus status;

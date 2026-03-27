@@ -1,8 +1,11 @@
 package com.inventory.backend.entity;
 
 import com.fasterxml.jackson.annotation.JsonIgnore;
+import jakarta.persistence.CascadeType;
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
+import jakarta.persistence.EnumType;
+import jakarta.persistence.Enumerated;
 import jakarta.persistence.FetchType;
 import jakarta.persistence.GeneratedValue;
 import jakarta.persistence.GenerationType;
@@ -18,7 +21,6 @@ import lombok.Getter;
 import lombok.NoArgsConstructor;
 import lombok.Setter;
 
-import java.time.LocalDate;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -44,18 +46,13 @@ public class Printer extends BaseEntity {
     @JoinColumn(name = "department_id", nullable = false)
     private Department department;
 
-    @ManyToOne(fetch = FetchType.LAZY)
-    @JoinColumn(name = "cartridge_model_id")
-    private CartridgeModel cartridgeModel;
-
-    @Column(name = "previous_replacement_date")
-    private LocalDate previousReplacementDate;
-
-    @Column(name = "last_replacement_date")
-    private LocalDate lastReplacementDate;
+    @Enumerated(EnumType.STRING)
+    @Column(name = "printer_type", nullable = false)
+    @Builder.Default
+    private PrinterType printerType = PrinterType.MONOCHROME;
 
     @JsonIgnore
-    @OneToMany(mappedBy = "printer")
+    @OneToMany(mappedBy = "printer", cascade = CascadeType.ALL, orphanRemoval = true)
     @Builder.Default
-    private List<PrinterInstallation> installations = new ArrayList<>();
+    private List<PrinterSlot> slots = new ArrayList<>();
 }

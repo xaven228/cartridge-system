@@ -1,0 +1,2 @@
+ALTER TABLE refill_history
+ADD COLUMN quantity INTEGER NOT NULL DEFAULT 1;

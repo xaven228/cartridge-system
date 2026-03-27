@@ -23,6 +23,7 @@ public class RefillHistoryResponse {
     private LocalDate sentAt;
     private LocalDate returnedAt;
     private RefillStatus status;
+    private Integer quantity;
     private String comment;
     private String createdBy;
 

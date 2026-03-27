@@ -26,6 +26,11 @@ public class CartridgeModelController {
         return cartridgeModelService.create(cartridgeModel);
     }
 
+    @PutMapping("/{id}")
+    public CartridgeModel update(@PathVariable Long id, @Valid @RequestBody CartridgeModel cartridgeModel) {
+        return cartridgeModelService.update(id, cartridgeModel);
+    }
+
     @DeleteMapping("/{id}")
     public void delete(@PathVariable Long id) {
         cartridgeModelService.delete(id);

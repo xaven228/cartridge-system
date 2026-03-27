@@ -9,14 +9,25 @@ export interface CurrentPrinterInstallation {
   empty?: boolean | null
 }
 
-export interface Printer {
-  id?: number
+export type PrinterType = 'MONOCHROME' | 'COLOR'
+
+export interface PrinterSlot {
   name: string
+  id?: number
   cartridgeModelId?: number | null
   cartridgeModelName?: string | null
   previousReplacementDate?: string | null
   lastReplacementDate?: string | null
   currentInstallation?: CurrentPrinterInstallation | null
+}
+
+export interface Printer {
+  id?: number
+  name: string
+  departmentId?: number | null
+  departmentName?: string | null
+  printerType: PrinterType
+  slots: PrinterSlot[]
 }
 
 export interface Department {
@@ -29,6 +40,8 @@ export interface Department {
 export interface CartridgeModel {
   id: number
   name: string
+  refillable: boolean
+  minimumQuantity: number
 }
 
 export interface Cartridge {
@@ -51,18 +64,18 @@ export interface Cartridge {
 export interface CreateDepartmentPayload {
   name: string
   description?: string
-  printers?: CreateDepartmentPrinterPayload[]
-}
-
-export interface CreateDepartmentPrinterPayload {
-  name: string
-  cartridgeModel?: {
-    id: number
-  }
 }
 
 export interface CreateCartridgeModelPayload {
   name: string
+  refillable: boolean
+  minimumQuantity: number
+}
+
+export interface UpdateCartridgeModelPayload {
+  name: string
+  refillable: boolean
+  minimumQuantity: number
 }
 
 export interface CreateCartridgePayload {
@@ -70,7 +83,7 @@ export interface CreateCartridgePayload {
   cartridgeModelId: number
   departmentId?: number
   quantity: number
-  refillable: boolean
+  refillable?: boolean
   status?: CartridgeStatus
   comment?: string
 }
@@ -82,6 +95,7 @@ export interface RefillHistoryRecord {
   sentAt: string | null
   returnedAt: string | null
   status: string
+  quantity: number
   comment?: string | null
   createdBy?: string | null
 }
@@ -101,6 +115,16 @@ export interface ReplaceCartridgePayload {
   comment?: string
   actionDate?: string
   createdBy?: string
+}
+
+export interface UpsertPrinterPayload {
+  name: string
+  departmentId: number
+  printerType: PrinterType
+  slots: Array<{
+    name: string
+    cartridgeModelId: number
+  }>
 }
 
 const API_BASE =
@@ -155,6 +179,10 @@ export function getCartridgeModels(): Promise<CartridgeModel[]> {
   return fetchJson<CartridgeModel[]>('/api/cartridge-models')
 }
 
+export function getPrinters(): Promise<Printer[]> {
+  return fetchJson<Printer[]>('/api/printers')
+}
+
 export function createDepartment(payload: CreateDepartmentPayload): Promise<Department> {
   return fetchJson<Department>('/api/departments', {
     method: 'POST',
@@ -175,9 +203,36 @@ export function deleteDepartment(id: number): Promise<void> {
   })
 }
 
+export function createPrinter(payload: UpsertPrinterPayload): Promise<Printer> {
+  return fetchJson<Printer>('/api/printers', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  })
+}
+
+export function updatePrinter(id: number, payload: UpsertPrinterPayload): Promise<Printer> {
+  return fetchJson<Printer>(`/api/printers/${id}`, {
+    method: 'PUT',
+    body: JSON.stringify(payload),
+  })
+}
+
+export function deletePrinter(id: number): Promise<void> {
+  return fetchJson<void>(`/api/printers/${id}`, {
+    method: 'DELETE',
+  })
+}
+
 export function createCartridgeModel(payload: CreateCartridgeModelPayload): Promise<CartridgeModel> {
   return fetchJson<CartridgeModel>('/api/cartridge-models', {
     method: 'POST',
+    body: JSON.stringify(payload),
+  })
+}
+
+export function updateCartridgeModel(id: number, payload: UpdateCartridgeModelPayload): Promise<CartridgeModel> {
+  return fetchJson<CartridgeModel>(`/api/cartridge-models/${id}`, {
+    method: 'PUT',
     body: JSON.stringify(payload),
   })
 }
@@ -229,13 +284,14 @@ export function adjustQuantity(id: number, quantity: number, comment: string): P
 
 export function sendToRefill(
   id: number,
+  quantity: number,
   sentAt: string,
   createdBy: string,
   comment: string,
 ): Promise<Cartridge> {
   return fetchJson<Cartridge>(`/api/cartridges/${id}/send-to-refill`, {
     method: 'POST',
-    body: JSON.stringify({ sentAt, createdBy, comment }),
+    body: JSON.stringify({ quantity, sentAt, createdBy, comment }),
   })
 }
 
@@ -280,18 +336,26 @@ export function updateCartridgeRefillable(id: number, refillable: boolean): Prom
 
 export function returnFromRefill(
   id: number,
+  quantity: number,
   returnedAt: string,
   createdBy: string,
   comment: string,
 ): Promise<Cartridge> {
   return fetchJson<Cartridge>(`/api/cartridges/${id}/return-from-refill`, {
     method: 'POST',
-    body: JSON.stringify({ returnedAt, createdBy, comment }),
+    body: JSON.stringify({ quantity, returnedAt, createdBy, comment }),
   })
 }
 
 export function writeOff(id: number, comment: string): Promise<Cartridge> {
   return fetchJson<Cartridge>(`/api/cartridges/${id}/write-off`, {
+    method: 'POST',
+    body: JSON.stringify({ comment }),
+  })
+}
+
+export function markCartridgeEmpty(id: number, comment: string): Promise<Cartridge> {
+  return fetchJson<Cartridge>(`/api/cartridges/${id}/mark-empty`, {
     method: 'POST',
     body: JSON.stringify({ comment }),
   })
