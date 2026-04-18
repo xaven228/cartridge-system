@@ -1,0 +1,75 @@
+package com.inventory.backend.dto
+
+data class ConsumptionReportRowResponse(
+    val modelName: String,
+    val installedOperations: Int,
+    val installedQuantity: Int,
+    val sentToRefillOperations: Int,
+    val sentToRefillQuantity: Int,
+    val returnedFromRefillOperations: Int,
+    val returnedFromRefillQuantity: Int,
+    val writtenOffOperations: Int,
+    val writtenOffQuantity: Int,
+    val totalOperations: Int,
+    val totalQuantity: Int,
+)
+
+data class ConsumptionReportResponse(
+    val dateFrom: String,
+    val dateTo: String,
+    val generatedAt: String,
+    val totalOperations: Int,
+    val totalQuantity: Int,
+    val rows: List<ConsumptionReportRowResponse>,
+)
+
+data class StockByDepartmentRowResponse(
+    val departmentId: Long,
+    val departmentName: String,
+    val inStockQuantity: Int,
+    val onRefillQuantity: Int,
+    val installedQuantity: Int,
+    val writtenOffQuantity: Int,
+    val totalQuantity: Int,
+)
+
+data class StockByModelRowResponse(
+    val cartridgeModelId: Long,
+    val cartridgeModelName: String,
+    val inStockQuantity: Int,
+    val onRefillQuantity: Int,
+    val installedQuantity: Int,
+    val writtenOffQuantity: Int,
+    val totalQuantity: Int,
+)
+
+data class StockByRoomRowResponse(
+    val roomId: Long?,
+    val roomName: String,
+    val inStockQuantity: Int,
+    val onRefillQuantity: Int,
+    val installedQuantity: Int,
+    val writtenOffQuantity: Int,
+    val totalQuantity: Int,
+)
+
+data class StockByTypeRowResponse(
+    val cartridgeType: String,
+    val inStockQuantity: Int,
+    val onRefillQuantity: Int,
+    val installedQuantity: Int,
+    val writtenOffQuantity: Int,
+    val totalQuantity: Int,
+)
+
+data class StockSnapshotReportResponse(
+    val generatedAt: String,
+    val totalInStock: Int,
+    val totalOnRefill: Int,
+    val totalInstalled: Int,
+    val totalWrittenOff: Int,
+    val byDepartment: List<StockByDepartmentRowResponse>,
+    val byModel: List<StockByModelRowResponse>,
+    val byRoom: List<StockByRoomRowResponse>,
+    val byType: List<StockByTypeRowResponse>,
+)

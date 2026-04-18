@@ -46,6 +46,11 @@ public class Printer extends BaseEntity {
     @JoinColumn(name = "department_id", nullable = false)
     private Department department;
 
+    @JsonIgnore
+    @ManyToOne(fetch = FetchType.LAZY)
+    @JoinColumn(name = "room_id")
+    private Room room;
+
     @Enumerated(EnumType.STRING)
     @Column(name = "printer_type", nullable = false)
     @Builder.Default

@@ -2,43 +2,73 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import type { FormEvent } from 'react'
 import {
   adjustQuantity,
+  createHallRequest,
+  createInventoryAsset,
   createCartridge,
   createCartridgeModel,
   createDepartment,
+  createNotificationThreshold,
+  createUser,
+  createRoom,
   createPrinter,
+  downloadConsumptionReportPdf,
+  downloadConsumptionReportXlsx,
   deleteCartridge,
   deleteCartridgeModel,
   deleteDepartment,
+  deleteHallRequest,
+  deleteInventoryAsset,
+  deleteNotificationThreshold,
   deletePrinter,
+  deleteRoom,
   getCartridges,
   getCartridgeModels,
+  getConsumptionReport,
+  getStockSnapshotReport,
   getActionLogs,
   getDepartments,
+  getHallRequests,
+  getInventoryAssets,
+  getInventoryAssetMovements,
+  getNotificationAlerts,
+  getNotificationThresholds,
   getPrinters,
+  getRooms,
   getRefillHistory,
+  getSystemModules,
+  getUsers,
   installCartridge,
   markCartridgeEmpty,
   replaceCartridge,
   removeCartridgeInstallation,
   returnFromRefill,
+  setAuthToken,
   sendToRefill,
+  signIn,
+  transferInventoryAsset,
   updateCartridgeModel,
   updateDepartment,
+  updateHallRequest,
+  updateInventoryAsset,
+  updateNotificationThreshold,
   updatePrinter,
+  updateRoom,
+  updateUser,
   writeOff,
 } from './api'
-import type { ActionLogRecord, Cartridge, CartridgeModel, CartridgeStatus, Department, Printer, PrinterType, RefillHistoryRecord } from './api'
+import type { ActionLogRecord, AuthUser, Cartridge, CartridgeModel, CartridgeStatus, Department, HallRequest, HallRequestPriority, HallRequestStatus, InventoryAsset, InventoryAssetStatus, NotificationAlert, NotificationThreshold, Printer, PrinterType, RefillHistoryRecord, Room, RoomStatus, UpsertHallRequestPayload, UpsertInventoryAssetPayload, UserAdminRecord, UserRole } from './api'
+import type { InventoryAssetMovement, TransferInventoryAssetPayload } from './api'
+import type { ConsumptionReport, StockSnapshotReport } from './api'
+import type { SystemModule } from './api'
 
 const STATUS_LIST: CartridgeStatus[] = ['IN_STOCK', 'INSTALLED', 'ON_REFILL', 'WRITTEN_OFF']
 const PAGE_SIZE = 8
 const STOCK_DEPARTMENT_NAME = 'Склад'
-const AUTH_STORAGE_KEY = 'cartridge-admin-session'
-const SAVED_PIN_STORAGE_KEY = 'cartridge-admin-pin'
-const SESSION_DURATION_MS = 30 * 60 * 1000
+const AUTH_STORAGE_KEY = 'cartridge-auth-session'
 
 type SortKey = 'departmentName' | 'status' | 'quantity' | 'refillCount'
 type ToastKind = 'success' | 'error'
-type TabKey = 'overview' | 'stock' | 'departments' | 'printers' | 'history' | 'create'
+type TabKey = 'overview' | 'stock' | 'departments' | 'printers' | 'history' | 'create' | 'notifications' | 'reports' | 'users' | 'inventory' | 'hall-requests'
 type DetailAction = 'send' | 'return' | 'writeoff' | null
 type RemovalOutcome = 'STOCK' | 'REFILL' | 'WRITE_OFF'
 type BatchEntry = { quantity: number; comment: string }
@@ -46,6 +76,10 @@ type PrinterSlotForm = { name: string; cartridgeModelId: number | '' }
 type DeleteTarget =
   | { kind: 'printer'; id: number; label: string }
   | { kind: 'department'; id: number; label: string }
+  | { kind: 'room'; id: number; label: string }
+  | { kind: 'threshold'; id: number; label: string }
+  | { kind: 'inventory-asset'; id: number; label: string }
+  | { kind: 'hall-request'; id: number; label: string }
   | { kind: 'cartridge'; id: number; label: string }
   | { kind: 'model'; id: number; label: string }
 
@@ -69,6 +103,66 @@ const STATUS_TONES: Record<CartridgeStatus, string> = {
   WRITTEN_OFF: 'status-written_off',
 }
 
+const ACTION_LOG_TYPE_OPTIONS: Array<{ value: string; label: string }> = [
+  { value: '', label: 'Все действия' },
+  { value: 'CARTRIDGE_CREATED', label: 'Приход' },
+  { value: 'CARTRIDGE_QUANTITY_CHANGED', label: 'Изменение остатка' },
+  { value: 'CARTRIDGE_INSTALLED', label: 'Установка' },
+  { value: 'CARTRIDGE_REMOVED', label: 'Снятие' },
+  { value: 'CARTRIDGE_SENT_TO_REFILL', label: 'Отправка на заправку' },
+  { value: 'CARTRIDGE_RETURNED_FROM_REFILL', label: 'Возврат с заправки' },
+  { value: 'CARTRIDGE_WRITTEN_OFF', label: 'Списание' },
+  { value: 'CARTRIDGE_MARKED_EMPTY', label: 'Пометка пустым' },
+  { value: 'CARTRIDGE_REFILLABLE_CHANGED', label: 'Изменение типа' },
+  { value: 'CARTRIDGE_DELETED', label: 'Удаление остатка' },
+  { value: 'DEPARTMENT_CREATED', label: 'Создание отдела' },
+  { value: 'DEPARTMENT_UPDATED', label: 'Изменение отдела' },
+  { value: 'DEPARTMENT_DELETED', label: 'Удаление отдела' },
+  { value: 'ROOM_CREATED', label: 'Создание кабинета' },
+  { value: 'ROOM_UPDATED', label: 'Изменение кабинета' },
+  { value: 'ROOM_DELETED', label: 'Удаление кабинета' },
+  { value: 'THRESHOLD_CREATED', label: 'Создание порога' },
+  { value: 'THRESHOLD_UPDATED', label: 'Изменение порога' },
+  { value: 'THRESHOLD_DELETED', label: 'Удаление порога' },
+  { value: 'INVENTORY_ASSET_CREATED', label: 'Создание актива' },
+  { value: 'INVENTORY_ASSET_UPDATED', label: 'Изменение актива' },
+  { value: 'INVENTORY_ASSET_DELETED', label: 'Удаление актива' },
+  { value: 'INVENTORY_ASSET_TRANSFERRED', label: 'Перемещение актива' },
+  { value: 'HALL_REQUEST_CREATED', label: 'Создание заявки по залу' },
+  { value: 'HALL_REQUEST_UPDATED', label: 'Изменение заявки по залу' },
+  { value: 'HALL_REQUEST_DELETED', label: 'Удаление заявки по залу' },
+  { value: 'HALL_REQUEST_ESCALATED', label: 'SLA-эскалация заявки' },
+  { value: 'CARTRIDGE_MODEL_CREATED', label: 'Создание модели' },
+  { value: 'CARTRIDGE_MODEL_DELETED', label: 'Удаление модели' },
+]
+
+const USER_ROLE_OPTIONS: Array<{ value: UserRole; label: string }> = [
+  { value: 'ADMIN', label: 'Администратор' },
+  { value: 'OPERATOR', label: 'Оператор' },
+  { value: 'VIEWER', label: 'Наблюдатель' },
+]
+
+const INVENTORY_STATUS_OPTIONS: Array<{ value: InventoryAssetStatus; label: string }> = [
+  { value: 'IN_USE', label: 'В использовании' },
+  { value: 'IN_STOCK', label: 'На складе' },
+  { value: 'IN_REPAIR', label: 'В ремонте' },
+  { value: 'WRITTEN_OFF', label: 'Списан' },
+]
+
+const HALL_REQUEST_PRIORITY_OPTIONS: Array<{ value: HallRequestPriority; label: string }> = [
+  { value: 'LOW', label: 'Низкий' },
+  { value: 'MEDIUM', label: 'Средний' },
+  { value: 'HIGH', label: 'Высокий' },
+  { value: 'URGENT', label: 'Срочный' },
+]
+
+const HALL_REQUEST_STATUS_OPTIONS: Array<{ value: HallRequestStatus; label: string }> = [
+  { value: 'OPEN', label: 'Открыта' },
+  { value: 'IN_PROGRESS', label: 'В работе' },
+  { value: 'DONE', label: 'Выполнена' },
+  { value: 'CANCELLED', label: 'Отменена' },
+]
+
 function getStockStateMeta(cartridge: Cartridge): { label: string; tone: string } {
   if (cartridge.status === 'ON_REFILL') {
     return { label: 'На заправке', tone: 'status-on_refill' }
@@ -87,6 +181,12 @@ function getStockStateMeta(cartridge: Cartridge): { label: string; tone: string 
 
 function today(): string {
   return new Date().toISOString().slice(0, 10)
+}
+
+function sixMonthsAgo(): string {
+  const value = new Date()
+  value.setMonth(value.getMonth() - 6)
+  return value.toISOString().slice(0, 10)
 }
 
 function formatHistoryStatus(status: string): string {
@@ -115,6 +215,20 @@ function formatActionType(actionType: string): string {
     DEPARTMENT_CREATED: 'Создание отдела',
     DEPARTMENT_UPDATED: 'Изменение отдела',
     DEPARTMENT_DELETED: 'Удаление отдела',
+    ROOM_CREATED: 'Создание кабинета',
+    ROOM_UPDATED: 'Изменение кабинета',
+    ROOM_DELETED: 'Удаление кабинета',
+    THRESHOLD_CREATED: 'Создание порога',
+    THRESHOLD_UPDATED: 'Изменение порога',
+    THRESHOLD_DELETED: 'Удаление порога',
+    INVENTORY_ASSET_CREATED: 'Создание актива',
+    INVENTORY_ASSET_UPDATED: 'Изменение актива',
+    INVENTORY_ASSET_DELETED: 'Удаление актива',
+    INVENTORY_ASSET_TRANSFERRED: 'Перемещение актива',
+    HALL_REQUEST_CREATED: 'Создание заявки по залу',
+    HALL_REQUEST_UPDATED: 'Изменение заявки по залу',
+    HALL_REQUEST_DELETED: 'Удаление заявки по залу',
+    HALL_REQUEST_ESCALATED: 'SLA-эскалация заявки',
     CARTRIDGE_MODEL_CREATED: 'Создание модели',
     CARTRIDGE_MODEL_DELETED: 'Удаление модели',
   }
@@ -124,6 +238,17 @@ function formatActionType(actionType: string): string {
 function formatDate(value?: string | null): string {
   if (!value) return '-'
   return value.split('-').reverse().join('.')
+}
+
+function formatDateTime(value?: string | null): string {
+  if (!value) return '-'
+  return value.replace('T', ' ').slice(0, 16)
+}
+
+function formatLocation(departmentName?: string | null, roomName?: string | null): string {
+  const department = departmentName || 'Без отдела'
+  const room = roomName || 'без кабинета'
+  return `${department} / ${room}`
 }
 
 function balanceTone(value: number): string {
@@ -148,11 +273,21 @@ function getDeleteCartridgeHint(cartridge: Cartridge): string {
 
 export default function App() {
   const [departments, setDepartments] = useState<Department[]>([])
+  const [rooms, setRooms] = useState<Room[]>([])
   const [printers, setPrinters] = useState<Printer[]>([])
   const [models, setModels] = useState<CartridgeModel[]>([])
   const [cartridges, setCartridges] = useState<Cartridge[]>([])
   const [history, setHistory] = useState<RefillHistoryRecord[]>([])
   const [actionLogs, setActionLogs] = useState<ActionLogRecord[]>([])
+  const [users, setUsers] = useState<UserAdminRecord[]>([])
+  const [systemModules, setSystemModules] = useState<SystemModule[]>([])
+  const [notificationAlerts, setNotificationAlerts] = useState<NotificationAlert[]>([])
+  const [notificationThresholds, setNotificationThresholds] = useState<NotificationThreshold[]>([])
+  const [consumptionReport, setConsumptionReport] = useState<ConsumptionReport | null>(null)
+  const [stockSnapshotReport, setStockSnapshotReport] = useState<StockSnapshotReport | null>(null)
+  const [inventoryAssets, setInventoryAssets] = useState<InventoryAsset[]>([])
+  const [inventoryMovements, setInventoryMovements] = useState<InventoryAssetMovement[]>([])
+  const [hallRequests, setHallRequests] = useState<HallRequest[]>([])
 
   const [departmentFilter, setDepartmentFilter] = useState<number | 'all'>('all')
   const [statusFilter, setStatusFilter] = useState<CartridgeStatus | 'all'>('all')
@@ -178,11 +313,60 @@ export default function App() {
   const [departmentName, setDepartmentName] = useState('')
   const [departmentDescription, setDepartmentDescription] = useState('')
   const [editingDepartmentId, setEditingDepartmentId] = useState<number | null>(null)
+  const [roomName, setRoomName] = useState('')
+  const [roomDepartmentId, setRoomDepartmentId] = useState<number | ''>('')
+  const [roomStatus, setRoomStatus] = useState<RoomStatus>('ACTIVE')
+  const [roomComment, setRoomComment] = useState('')
+  const [editingRoomId, setEditingRoomId] = useState<number | null>(null)
   const [printerName, setPrinterName] = useState('')
   const [printerDepartmentId, setPrinterDepartmentId] = useState<number | ''>('')
+  const [printerRoomId, setPrinterRoomId] = useState<number | ''>('')
   const [printerType, setPrinterType] = useState<PrinterType>('MONOCHROME')
   const [printerSlots, setPrinterSlots] = useState<PrinterSlotForm[]>([{ name: 'Основной', cartridgeModelId: '' }])
   const [editingPrinterId, setEditingPrinterId] = useState<number | null>(null)
+  const [thresholdModelId, setThresholdModelId] = useState<number | ''>('')
+  const [thresholdDepartmentId, setThresholdDepartmentId] = useState<number | ''>('')
+  const [thresholdMinimum, setThresholdMinimum] = useState(0)
+  const [thresholdActive, setThresholdActive] = useState(true)
+  const [thresholdComment, setThresholdComment] = useState('')
+  const [editingThresholdId, setEditingThresholdId] = useState<number | null>(null)
+  const [reportDateFrom, setReportDateFrom] = useState(sixMonthsAgo())
+  const [reportDateTo, setReportDateTo] = useState(today())
+  const [historyDateFrom, setHistoryDateFrom] = useState(sixMonthsAgo())
+  const [historyDateTo, setHistoryDateTo] = useState(today())
+  const [historyActor, setHistoryActor] = useState('')
+  const [historyActionType, setHistoryActionType] = useState('')
+  const [historyTargetName, setHistoryTargetName] = useState('')
+  const [assetFilterDepartmentId, setAssetFilterDepartmentId] = useState<number | ''>('')
+  const [assetFilterRoomId, setAssetFilterRoomId] = useState<number | ''>('')
+  const [assetFilterStatus, setAssetFilterStatus] = useState<InventoryAssetStatus | ''>('')
+  const [assetMovementFilterAssetId, setAssetMovementFilterAssetId] = useState<number | ''>('')
+  const [hallFilterRoomId, setHallFilterRoomId] = useState<number | ''>('')
+  const [hallFilterStatus, setHallFilterStatus] = useState<HallRequestStatus | ''>('')
+  const [hallOverdueOnly, setHallOverdueOnly] = useState(false)
+  const [assetInventoryCode, setAssetInventoryCode] = useState('')
+  const [assetName, setAssetName] = useState('')
+  const [assetCategory, setAssetCategory] = useState('')
+  const [assetDepartmentId, setAssetDepartmentId] = useState<number | ''>('')
+  const [assetRoomId, setAssetRoomId] = useState<number | ''>('')
+  const [assetStatus, setAssetStatus] = useState<InventoryAssetStatus>('IN_USE')
+  const [assetQuantity, setAssetQuantity] = useState(1)
+  const [assetComment, setAssetComment] = useState('')
+  const [editingAssetId, setEditingAssetId] = useState<number | null>(null)
+  const [transferAssetId, setTransferAssetId] = useState<number | ''>('')
+  const [transferDepartmentId, setTransferDepartmentId] = useState<number | ''>('')
+  const [transferRoomId, setTransferRoomId] = useState<number | ''>('')
+  const [transferActor, setTransferActor] = useState('Администратор')
+  const [transferComment, setTransferComment] = useState('')
+  const [transferMovedAt, setTransferMovedAt] = useState('')
+  const [hallRoomId, setHallRoomId] = useState<number | ''>('')
+  const [hallRequesterName, setHallRequesterName] = useState('')
+  const [hallTitle, setHallTitle] = useState('')
+  const [hallDescription, setHallDescription] = useState('')
+  const [hallPriority, setHallPriority] = useState<HallRequestPriority>('MEDIUM')
+  const [hallStatus, setHallStatus] = useState<HallRequestStatus>('OPEN')
+  const [hallPlannedAt, setHallPlannedAt] = useState('')
+  const [editingHallRequestId, setEditingHallRequestId] = useState<number | null>(null)
   const [modelName, setModelName] = useState('')
   const [modelRefillable, setModelRefillable] = useState(true)
   const [modelMinimumQuantity, setModelMinimumQuantity] = useState(0)
@@ -199,34 +383,36 @@ export default function App() {
   const [loading, setLoading] = useState(false)
   const [toasts, setToasts] = useState<Toast[]>([])
 
-  const [authPin, setAuthPin] = useState('')
+  const [authLogin, setAuthLogin] = useState('')
+  const [authPassword, setAuthPassword] = useState('')
   const [authError, setAuthError] = useState('')
-  const [authRemember, setAuthRemember] = useState(false)
   const [isAuthed, setIsAuthed] = useState(false)
   const [sessionUser, setSessionUser] = useState('')
   const [sessionExpiresAt, setSessionExpiresAt] = useState<number | null>(null)
-
-  const adminPin = import.meta.env.VITE_ADMIN_PIN || '1111'
+  const [authUser, setAuthUser] = useState<AuthUser | null>(null)
+  const [editingUserId, setEditingUserId] = useState<number | null>(null)
+  const [userLogin, setUserLogin] = useState('')
+  const [userFullName, setUserFullName] = useState('')
+  const [userPassword, setUserPassword] = useState('')
+  const [userRole, setUserRole] = useState<UserRole>('OPERATOR')
+  const [userActive, setUserActive] = useState(true)
 
   const clearStoredSession = useCallback(() => {
     localStorage.removeItem(AUTH_STORAGE_KEY)
+    setAuthToken(null)
     setIsAuthed(false)
     setSessionUser('')
     setSessionExpiresAt(null)
+    setAuthUser(null)
   }, [])
 
-  const persistSession = useCallback((user: string, rememberPin: boolean, pin: string) => {
-    const expiresAt = Date.now() + SESSION_DURATION_MS
-    localStorage.setItem(AUTH_STORAGE_KEY, JSON.stringify({ user, expiresAt }))
-    if (rememberPin) {
-      localStorage.setItem(SAVED_PIN_STORAGE_KEY, pin)
-    } else {
-      localStorage.removeItem(SAVED_PIN_STORAGE_KEY)
-    }
-
+  const persistSession = useCallback((token: string, user: AuthUser, expiresAt: number) => {
+    localStorage.setItem(AUTH_STORAGE_KEY, JSON.stringify({ token, user, expiresAt }))
+    setAuthToken(token)
     setIsAuthed(true)
-    setSessionUser(user)
+    setSessionUser(user.fullName)
     setSessionExpiresAt(expiresAt)
+    setAuthUser(user)
   }, [])
 
   const pushToast = useCallback((kind: ToastKind, text: string) => {
@@ -311,6 +497,26 @@ export default function App() {
     [departments],
   )
 
+  const activeRooms = useMemo(
+    () => rooms.filter((room) => room.status === 'ACTIVE'),
+    [rooms],
+  )
+
+  const availableRoomsForPrinter = useMemo(
+    () => activeRooms.filter((room) => printerDepartmentId && room.departmentId === printerDepartmentId),
+    [activeRooms, printerDepartmentId],
+  )
+
+  const availableRoomsForAsset = useMemo(
+    () => activeRooms.filter((room) => assetDepartmentId && room.departmentId === assetDepartmentId),
+    [activeRooms, assetDepartmentId],
+  )
+
+  const availableRoomsForTransfer = useMemo(
+    () => activeRooms.filter((room) => transferDepartmentId && room.departmentId === transferDepartmentId),
+    [activeRooms, transferDepartmentId],
+  )
+
   const departmentStats = useMemo(() => {
     return userDepartments
       .map((department) => {
@@ -334,27 +540,23 @@ export default function App() {
     : 0
 
   useEffect(() => {
-    const savedPin = localStorage.getItem(SAVED_PIN_STORAGE_KEY)
-    if (savedPin) {
-      setAuthPin(savedPin)
-      setAuthRemember(true)
-    }
-
     const rawSession = localStorage.getItem(AUTH_STORAGE_KEY)
     if (!rawSession) return
 
     try {
-      const parsed = JSON.parse(rawSession) as { user?: string; expiresAt?: number }
-      if (!parsed.user || !parsed.expiresAt || parsed.expiresAt <= Date.now()) {
+      const parsed = JSON.parse(rawSession) as { token?: string; user?: AuthUser; expiresAt?: number }
+      if (!parsed.token || !parsed.user || !parsed.expiresAt || parsed.expiresAt <= Date.now()) {
         localStorage.removeItem(AUTH_STORAGE_KEY)
         return
       }
 
+      setAuthToken(parsed.token)
       setIsAuthed(true)
-      setSessionUser(parsed.user)
+      setSessionUser(parsed.user.fullName)
       setSessionExpiresAt(parsed.expiresAt)
-      setActor(parsed.user)
-      setDetailActor(parsed.user)
+      setActor(parsed.user.fullName)
+      setDetailActor(parsed.user.fullName)
+      setAuthUser(parsed.user)
     } catch {
       localStorage.removeItem(AUTH_STORAGE_KEY)
     }
@@ -375,6 +577,7 @@ export default function App() {
           slotId: slot.id ?? null,
           departmentId: department.id,
           departmentName: department.name,
+          roomName: printer.roomName ?? '-',
           printerName: printer.name,
           printerType: printer.printerType,
           slotName: slot.name,
@@ -518,26 +721,78 @@ export default function App() {
     }, {})
   }, [actionLogs, cartridges])
 
+  const loadActionLogs = useCallback(async () => {
+    const normalizedFrom =
+      historyDateFrom && historyDateTo && historyDateFrom > historyDateTo ? historyDateTo : historyDateFrom
+    const normalizedTo =
+      historyDateFrom && historyDateTo && historyDateFrom > historyDateTo ? historyDateFrom : historyDateTo
+    const logs = await getActionLogs({
+      dateFrom: normalizedFrom || undefined,
+      dateTo: normalizedTo || undefined,
+      actor: historyActor || undefined,
+      actionType: historyActionType || undefined,
+      targetName: historyTargetName || undefined,
+    })
+    setActionLogs(logs)
+  }, [historyActionType, historyActor, historyDateFrom, historyDateTo, historyTargetName])
+
+  const loadInventoryAssets = useCallback(async () => {
+    const rows = await getInventoryAssets({
+      departmentId: assetFilterDepartmentId || undefined,
+      roomId: assetFilterRoomId || undefined,
+      status: assetFilterStatus || undefined,
+    })
+    setInventoryAssets(rows)
+  }, [assetFilterDepartmentId, assetFilterRoomId, assetFilterStatus])
+
+  const loadInventoryMovements = useCallback(async () => {
+    const rows = await getInventoryAssetMovements(assetMovementFilterAssetId || undefined)
+    setInventoryMovements(rows)
+  }, [assetMovementFilterAssetId])
+
+  const loadHallRequests = useCallback(async () => {
+    const rows = await getHallRequests({
+      roomId: hallFilterRoomId || undefined,
+      status: hallFilterStatus || undefined,
+      overdue: hallOverdueOnly ? true : undefined,
+    })
+    setHallRequests(rows)
+  }, [hallFilterRoomId, hallFilterStatus, hallOverdueOnly])
+
   const refreshCatalog = useCallback(async () => {
     setLoading(true)
     try {
-      const [deps, loadedPrinters, loadedModels, cart] = await Promise.all([
+      const [deps, loadedRooms, loadedPrinters, loadedModels, cart, moduleCatalog, alerts, thresholds] = await Promise.all([
         getDepartments(),
+        getRooms(),
         getPrinters(),
         getCartridgeModels(),
         getCartridges(),
+        getSystemModules(),
+        getNotificationAlerts(),
+        getNotificationThresholds(),
       ])
       setDepartments(deps)
+      setRooms(loadedRooms)
       setPrinters(loadedPrinters)
       setModels(loadedModels)
       setCartridges(cart)
-      setActionLogs(await getActionLogs())
+      setSystemModules(moduleCatalog)
+      setNotificationAlerts(alerts)
+      setNotificationThresholds(thresholds)
+      await loadActionLogs()
+      await Promise.all([loadInventoryAssets(), loadInventoryMovements(), loadHallRequests()])
+      if (authUser?.permissions.canManageUsers) {
+        setUsers(await getUsers())
+      } else {
+        setUsers([])
+      }
     } catch (e) {
       pushToast('error', e instanceof Error ? e.message : 'Не удалось загрузить данные.')
     } finally {
       setLoading(false)
     }
-  }, [pushToast])
+  }, [authUser?.permissions.canManageUsers, loadActionLogs, loadHallRequests, loadInventoryAssets, loadInventoryMovements, pushToast])
 
   const refreshHistory = useCallback(
     async (cartridgeId: number) => {
@@ -575,12 +830,67 @@ export default function App() {
   }, [selectedCartridge, actor])
 
   useEffect(() => {
+    if (!isAuthed || activeTab !== 'reports') return
+    void loadConsumptionReport()
+  }, [activeTab, isAuthed, reportDateFrom, reportDateTo])
+
+  useEffect(() => {
+    if (!isAuthed) return
+    void loadActionLogs()
+  }, [isAuthed, loadActionLogs])
+
+  useEffect(() => {
+    if (!isAuthed) return
+    void loadInventoryAssets()
+  }, [isAuthed, loadInventoryAssets])
+
+  useEffect(() => {
+    if (!isAuthed) return
+    void loadInventoryMovements()
+  }, [isAuthed, loadInventoryMovements])
+
+  useEffect(() => {
+    if (!isAuthed) return
+    void loadHallRequests()
+  }, [isAuthed, loadHallRequests])
+
+  useEffect(() => {
+    if (authUser?.permissions.canManageUsers) return
+    setUsers([])
+    resetUserForm()
+    if (activeTab === 'users') {
+      setActiveTab('overview')
+    }
+  }, [activeTab, authUser?.permissions.canManageUsers])
+
+  useEffect(() => {
     setCurrentPage(1)
   }, [searchTerm, departmentFilter, statusFilter])
 
   useEffect(() => {
     if (currentPage > totalPages) setCurrentPage(totalPages)
   }, [currentPage, totalPages])
+
+  useEffect(() => {
+    if (!printerRoomId) return
+    if (!availableRoomsForPrinter.some((room) => room.id === printerRoomId)) {
+      setPrinterRoomId('')
+    }
+  }, [availableRoomsForPrinter, printerRoomId])
+
+  useEffect(() => {
+    if (!assetRoomId) return
+    if (!availableRoomsForAsset.some((room) => room.id === assetRoomId)) {
+      setAssetRoomId('')
+    }
+  }, [assetRoomId, availableRoomsForAsset])
+
+  useEffect(() => {
+    if (!transferRoomId) return
+    if (!availableRoomsForTransfer.some((room) => room.id === transferRoomId)) {
+      setTransferRoomId('')
+    }
+  }, [availableRoomsForTransfer, transferRoomId])
 
   useEffect(() => {
     setSelectedBatchModelIds((current) => current.filter((id) => models.some((model) => model.id === id)))
@@ -597,6 +907,21 @@ export default function App() {
       setActiveBatchIndex(Math.max(0, selectedBatchModels.length - 1))
     }
   }, [activeBatchIndex, selectedBatchModels.length])
+
+  useEffect(() => {
+    if (!sessionExpiresAt) return
+    if (sessionExpiresAt <= Date.now()) {
+      clearStoredSession()
+      return
+    }
+
+    const timer = window.setTimeout(() => {
+      clearStoredSession()
+      pushToast('error', 'Сессия истекла. Войдите снова.')
+    }, Math.max(0, sessionExpiresAt - Date.now()))
+
+    return () => window.clearTimeout(timer)
+  }, [clearStoredSession, pushToast, sessionExpiresAt])
 
   async function applyFilters() {
     setLoading(true)
@@ -618,7 +943,6 @@ export default function App() {
       await action()
       pushToast('success', successText)
       await refreshCatalog()
-      setActionLogs(await getActionLogs())
       if (selectedCartridgeId) await refreshHistory(selectedCartridgeId)
     } catch (e) {
       pushToast('error', e instanceof Error ? e.message : 'Операция завершилась ошибкой.')
@@ -646,6 +970,129 @@ export default function App() {
     setDepartmentDescription('')
   }
 
+  function beginRoomEdit(room: Room) {
+    setEditingRoomId(room.id)
+    setRoomName(room.name)
+    setRoomDepartmentId(room.departmentId)
+    setRoomStatus(room.status)
+    setRoomComment(room.comment || '')
+    setActiveTab('departments')
+  }
+
+  function resetRoomForm() {
+    setEditingRoomId(null)
+    setRoomName('')
+    setRoomDepartmentId('')
+    setRoomStatus('ACTIVE')
+    setRoomComment('')
+  }
+
+  function beginThresholdEdit(item: NotificationThreshold) {
+    setEditingThresholdId(item.id)
+    setThresholdModelId(item.cartridgeModelId)
+    setThresholdDepartmentId(item.departmentId ?? '')
+    setThresholdMinimum(item.minimumQuantity)
+    setThresholdActive(item.active)
+    setThresholdComment(item.comment || '')
+    setActiveTab('notifications')
+  }
+
+  function resetThresholdForm() {
+    setEditingThresholdId(null)
+    setThresholdModelId('')
+    setThresholdDepartmentId('')
+    setThresholdMinimum(0)
+    setThresholdActive(true)
+    setThresholdComment('')
+  }
+
+  function beginAssetEdit(asset: InventoryAsset) {
+    setEditingAssetId(asset.id)
+    setAssetInventoryCode(asset.inventoryCode)
+    setAssetName(asset.name)
+    setAssetCategory(asset.category || '')
+    setAssetDepartmentId(asset.departmentId ?? '')
+    setAssetRoomId(asset.roomId ?? '')
+    setAssetStatus(asset.status)
+    setAssetQuantity(asset.quantity)
+    setAssetComment(asset.comment || '')
+    setTransferAssetId(asset.id)
+    setActiveTab('inventory')
+  }
+
+  function resetAssetForm() {
+    setEditingAssetId(null)
+    setAssetInventoryCode('')
+    setAssetName('')
+    setAssetCategory('')
+    setAssetDepartmentId('')
+    setAssetRoomId('')
+    setAssetStatus('IN_USE')
+    setAssetQuantity(1)
+    setAssetComment('')
+  }
+
+  function beginAssetTransfer(asset: InventoryAsset) {
+    setTransferAssetId(asset.id)
+    setTransferDepartmentId(asset.departmentId ?? '')
+    setTransferRoomId(asset.roomId ?? '')
+    setTransferActor(actor || 'Администратор')
+    setTransferComment('')
+    setTransferMovedAt('')
+    setActiveTab('inventory')
+  }
+
+  function resetTransferForm() {
+    setTransferAssetId('')
+    setTransferDepartmentId('')
+    setTransferRoomId('')
+    setTransferActor(actor || 'Администратор')
+    setTransferComment('')
+    setTransferMovedAt('')
+  }
+
+  function beginHallRequestEdit(request: HallRequest) {
+    setEditingHallRequestId(request.id)
+    setHallRoomId(request.roomId)
+    setHallRequesterName(request.requesterName)
+    setHallTitle(request.title)
+    setHallDescription(request.description || '')
+    setHallPriority(request.priority)
+    setHallStatus(request.status)
+    setHallPlannedAt(request.plannedAt ? request.plannedAt.slice(0, 16) : '')
+    setActiveTab('hall-requests')
+  }
+
+  function resetHallRequestForm() {
+    setEditingHallRequestId(null)
+    setHallRoomId('')
+    setHallRequesterName('')
+    setHallTitle('')
+    setHallDescription('')
+    setHallPriority('MEDIUM')
+    setHallStatus('OPEN')
+    setHallPlannedAt('')
+  }
+
+  function beginUserEdit(user: UserAdminRecord) {
+    setEditingUserId(user.id)
+    setUserLogin(user.username)
+    setUserFullName(user.fullName)
+    setUserPassword('')
+    setUserRole(user.role)
+    setUserActive(user.active)
+    setActiveTab('users')
+  }
+
+  function resetUserForm() {
+    setEditingUserId(null)
+    setUserLogin('')
+    setUserFullName('')
+    setUserPassword('')
+    setUserRole('OPERATOR')
+    setUserActive(true)
+  }
+
   function requestDelete(target: DeleteTarget) {
     if (!confirmAdminPin()) return
     setDeleteTarget(target)
@@ -668,6 +1115,34 @@ export default function App() {
           if (editingDepartmentId === deleteTarget.id) resetDepartmentForm()
           setDeleteTarget(null)
         }, 'Отдел удален.')
+        break
+      case 'room':
+        void withAction(async () => {
+          await deleteRoom(deleteTarget.id)
+          if (editingRoomId === deleteTarget.id) resetRoomForm()
+          setDeleteTarget(null)
+        }, 'Кабинет удален.')
+        break
+      case 'threshold':
+        void withAction(async () => {
+          await deleteNotificationThreshold(deleteTarget.id)
+          if (editingThresholdId === deleteTarget.id) resetThresholdForm()
+          setDeleteTarget(null)
+        }, 'Порог уведомления удален.')
+        break
+      case 'inventory-asset':
+        void withAction(async () => {
+          await deleteInventoryAsset(deleteTarget.id)
+          if (editingAssetId === deleteTarget.id) resetAssetForm()
+          setDeleteTarget(null)
+        }, 'Инвентарный актив удален.')
+        break
+      case 'hall-request':
+        void withAction(async () => {
+          await deleteHallRequest(deleteTarget.id)
+          if (editingHallRequestId === deleteTarget.id) resetHallRequestForm()
+          setDeleteTarget(null)
+        }, 'Заявка по залу удалена.')
         break
       case 'cartridge':
         void withAction(async () => {
@@ -867,20 +1342,39 @@ export default function App() {
   function onSignIn(event: FormEvent) {
     event.preventDefault()
     setAuthError('')
-    if (authPin !== adminPin) {
-      setAuthError('Неверный админский PIN.')
+    if (!authLogin.trim() || !authPassword.trim()) {
+      setAuthError('Введите логин и пароль.')
       return
     }
-    persistSession('Администратор', authRemember, authPin)
-    setActor('Администратор')
-    setDetailActor('Администратор')
-    setActiveTab('departments')
+
+    void (async () => {
+      try {
+        const response = await signIn(authLogin.trim(), authPassword)
+        persistSession(response.token, response.user, response.expiresAt)
+        setActor(response.user.fullName)
+        setDetailActor(response.user.fullName)
+        setActiveTab('departments')
+      } catch (e) {
+        setAuthError(e instanceof Error ? e.message : 'Не удалось выполнить вход.')
+      }
+    })()
   }
 
   function onLogout() {
     clearStoredSession()
+    setAuthPassword('')
     setSelectedCartridgeId('')
     setHistory([])
+    setUsers([])
+    setInventoryAssets([])
+    setInventoryMovements([])
+    setHallRequests([])
+    setAssetMovementFilterAssetId('')
+    setHallOverdueOnly(false)
+    resetUserForm()
+    resetAssetForm()
+    resetTransferForm()
+    resetHallRequestForm()
     setToasts([])
     setActiveTab('departments')
   }
@@ -954,6 +1448,185 @@ export default function App() {
       }
       resetDepartmentForm()
     }, editingDepartmentId ? 'Отдел обновлен.' : 'Отдел создан.')
+  }
+
+  function onCreateRoom(event: FormEvent) {
+    event.preventDefault()
+    if (!roomName.trim()) {
+      pushToast('error', 'Введите название кабинета.')
+      return
+    }
+    if (!roomDepartmentId) {
+      pushToast('error', 'Выберите отдел для кабинета.')
+      return
+    }
+
+    void withAction(async () => {
+      const payload = {
+        name: roomName.trim(),
+        departmentId: roomDepartmentId,
+        status: roomStatus,
+        comment: roomComment.trim(),
+      }
+
+      if (editingRoomId) {
+        await updateRoom(editingRoomId, payload)
+      } else {
+        await createRoom(payload)
+      }
+      resetRoomForm()
+    }, editingRoomId ? 'Кабинет обновлен.' : 'Кабинет создан.')
+  }
+
+  function onSaveThreshold(event: FormEvent) {
+    event.preventDefault()
+    if (!thresholdModelId) {
+      pushToast('error', 'Выберите модель картриджа для порога.')
+      return
+    }
+
+    const payload = {
+      cartridgeModelId: thresholdModelId,
+      departmentId: thresholdDepartmentId || undefined,
+      minimumQuantity: Math.max(0, thresholdMinimum),
+      active: thresholdActive,
+      comment: thresholdComment.trim(),
+    }
+
+    void withAction(async () => {
+      if (editingThresholdId) {
+        await updateNotificationThreshold(editingThresholdId, payload)
+      } else {
+        await createNotificationThreshold(payload)
+      }
+      resetThresholdForm()
+    }, editingThresholdId ? 'Порог обновлен.' : 'Порог создан.')
+  }
+
+  function onSaveUser(event: FormEvent) {
+    event.preventDefault()
+    if (!authUser?.permissions.canManageUsers) {
+      pushToast('error', 'Недостаточно прав для управления пользователями.')
+      return
+    }
+    if (!userLogin.trim()) {
+      pushToast('error', 'Введите логин пользователя.')
+      return
+    }
+    if (!userFullName.trim()) {
+      pushToast('error', 'Введите ФИО пользователя.')
+      return
+    }
+    if (!editingUserId && !userPassword.trim()) {
+      pushToast('error', 'Для нового пользователя нужен пароль.')
+      return
+    }
+
+    void withAction(async () => {
+      const payload = {
+        username: userLogin.trim(),
+        fullName: userFullName.trim(),
+        password: userPassword.trim() || undefined,
+        role: userRole,
+        active: userActive,
+      }
+
+      if (editingUserId) {
+        await updateUser(editingUserId, payload)
+      } else {
+        await createUser(payload)
+      }
+      resetUserForm()
+    }, editingUserId ? 'Пользователь обновлен.' : 'Пользователь создан.')
+  }
+
+  function onSaveInventoryAsset(event: FormEvent) {
+    event.preventDefault()
+    if (!assetInventoryCode.trim()) {
+      pushToast('error', 'Введите инвентарный номер актива.')
+      return
+    }
+    if (!assetName.trim()) {
+      pushToast('error', 'Введите название актива.')
+      return
+    }
+
+    void withAction(async () => {
+      const payload: UpsertInventoryAssetPayload = {
+        inventoryCode: assetInventoryCode.trim(),
+        name: assetName.trim(),
+        category: assetCategory.trim() || undefined,
+        departmentId: assetDepartmentId || undefined,
+        roomId: assetRoomId || undefined,
+        status: assetStatus,
+        quantity: Math.max(0, assetQuantity),
+        comment: assetComment.trim() || undefined,
+      }
+
+      if (editingAssetId) {
+        await updateInventoryAsset(editingAssetId, payload)
+      } else {
+        await createInventoryAsset(payload)
+      }
+      resetAssetForm()
+    }, editingAssetId ? 'Инвентарный актив обновлен.' : 'Инвентарный актив создан.')
+  }
+
+  function onTransferInventoryAsset(event: FormEvent) {
+    event.preventDefault()
+    if (!transferAssetId) {
+      pushToast('error', 'Выберите актив для перемещения.')
+      return
+    }
+
+    const payload: TransferInventoryAssetPayload = {
+      toDepartmentId: transferDepartmentId || undefined,
+      toRoomId: transferRoomId || undefined,
+      actor: transferActor.trim() || undefined,
+      comment: transferComment.trim() || undefined,
+      movedAt: transferMovedAt || undefined,
+    }
+
+    void withAction(async () => {
+      await transferInventoryAsset(transferAssetId, payload)
+      setAssetMovementFilterAssetId(transferAssetId)
+      resetTransferForm()
+    }, 'Актив перемещен.')
+  }
+
+  function onSaveHallRequest(event: FormEvent) {
+    event.preventDefault()
+    if (!hallRoomId) {
+      pushToast('error', 'Выберите кабинет.')
+      return
+    }
+    if (!hallRequesterName.trim()) {
+      pushToast('error', 'Введите имя заявителя.')
+      return
+    }
+    if (!hallTitle.trim()) {
+      pushToast('error', 'Введите тему заявки.')
+      return
+    }
+
+    void withAction(async () => {
+      const payload: UpsertHallRequestPayload = {
+        roomId: hallRoomId,
+        requesterName: hallRequesterName.trim(),
+        title: hallTitle.trim(),
+        description: hallDescription.trim() || undefined,
+        priority: hallPriority,
+        status: hallStatus,
+        plannedAt: hallPlannedAt || undefined,
+      }
+
+      if (editingHallRequestId) {
+        await updateHallRequest(editingHallRequestId, payload)
+      } else {
+        await createHallRequest(payload)
+      }
+      resetHallRequestForm()
+    }, editingHallRequestId ? 'Заявка по залу обновлена.' : 'Заявка по залу создана.')
   }
 
   function onCreateModel(event: FormEvent) {
@@ -1047,6 +1720,7 @@ export default function App() {
     setEditingPrinterId(null)
     setPrinterName('')
     setPrinterDepartmentId('')
+    setPrinterRoomId('')
     setPrinterType('MONOCHROME')
     setPrinterSlots([{ name: 'Основной', cartridgeModelId: '' }])
   }
@@ -1055,6 +1729,7 @@ export default function App() {
     setEditingPrinterId(printer.id ?? null)
     setPrinterName(printer.name)
     setPrinterDepartmentId(printer.departmentId ?? '')
+    setPrinterRoomId(printer.roomId ?? '')
     setPrinterType(printer.printerType)
     setPrinterSlots(
       (printer.slots ?? []).map((slot) => ({
@@ -1107,6 +1782,7 @@ export default function App() {
     const payload = {
       name: printerName.trim(),
       departmentId: printerDepartmentId,
+      roomId: printerRoomId || undefined,
       printerType,
       slots: printerSlots.map((slot) => ({
         name: slot.name.trim(),
@@ -1132,12 +1808,70 @@ export default function App() {
     requestDelete({ kind: 'department', id, label: name })
   }
 
+  function onDeleteRoom(id: number, name: string) {
+    requestDelete({ kind: 'room', id, label: name })
+  }
+
+  function onDeleteThreshold(id: number, label: string) {
+    requestDelete({ kind: 'threshold', id, label })
+  }
+
   function onDeleteCartridge(id: number, title: string) {
     requestDelete({ kind: 'cartridge', id, label: title })
   }
 
   function onDeleteCartridgeModel(id: number, name: string) {
     requestDelete({ kind: 'model', id, label: name })
+  }
+
+  function onDeleteInventoryAsset(id: number, name: string) {
+    requestDelete({ kind: 'inventory-asset', id, label: name })
+  }
+
+  function onDeleteHallRequest(id: number, title: string) {
+    requestDelete({ kind: 'hall-request', id, label: title })
+  }
+
+  async function loadConsumptionReport() {
+    try {
+      const [report, snapshot] = await Promise.all([
+        getConsumptionReport(reportDateFrom, reportDateTo),
+        getStockSnapshotReport(),
+      ])
+      setConsumptionReport(report)
+      setStockSnapshotReport(snapshot)
+    } catch (e) {
+      pushToast('error', e instanceof Error ? e.message : 'Не удалось загрузить отчет.')
+    }
+  }
+
+  function saveBlob(blob: Blob, filename: string) {
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = filename
+    document.body.appendChild(link)
+    link.click()
+    link.remove()
+    URL.revokeObjectURL(url)
+  }
+
+  async function onExportReportXlsx() {
+    try {
+      const blob = await downloadConsumptionReportXlsx(reportDateFrom, reportDateTo)
+      saveBlob(blob, `consumption-${reportDateFrom}-${reportDateTo}.xlsx`)
+    } catch (e) {
+      pushToast('error', e instanceof Error ? e.message : 'Не удалось выгрузить Excel-отчет.')
+    }
+  }
+
+  async function onExportReportPdf() {
+    try {
+      const blob = await downloadConsumptionReportPdf(reportDateFrom, reportDateTo)
+      saveBlob(blob, `consumption-${reportDateFrom}-${reportDateTo}.pdf`)
+    } catch (e) {
+      pushToast('error', e instanceof Error ? e.message : 'Не удалось выгрузить PDF-отчет.')
+    }
   }
 
   return (
@@ -1147,25 +1881,25 @@ export default function App() {
           <div className="auth-panel admin-auth-panel">
             <p className="eyebrow">Admin Access</p>
             <h1>Вход в панель</h1>
-            <p className="subtitle">Сессия хранится 30 минут. PIN можно сохранить на этом устройстве.</p>
+            <p className="subtitle">Сессия хранится 30 минут. Вход по логину и паролю.</p>
             <form className="auth-form" onSubmit={onSignIn}>
               <label>
-                Админский PIN
+                Логин
                 <input
-                  type="password"
-                  value={authPin}
-                  onChange={(e) => setAuthPin(e.target.value)}
-                  placeholder="Введите PIN администратора"
+                  value={authLogin}
+                  onChange={(e) => setAuthLogin(e.target.value)}
+                  placeholder="Введите логин"
                   autoFocus
                 />
               </label>
-              <label className="checkbox-line">
+              <label>
+                Пароль
                 <input
-                  type="checkbox"
-                  checked={authRemember}
-                  onChange={(e) => setAuthRemember(e.target.checked)}
+                  type="password"
+                  value={authPassword}
+                  onChange={(e) => setAuthPassword(e.target.value)}
+                  placeholder="Введите пароль"
                 />
-                <span>Запомнить PIN на этом устройстве</span>
               </label>
               <button type="submit">Войти в панель</button>
             </form>
@@ -1181,6 +1915,7 @@ export default function App() {
         <div className="table-actions">
           {loading && <span className="table-muted">Синхронизация...</span>}
           <span className="table-muted">{sessionUser}</span>
+          {authUser && <span className="table-muted">Роль: {authUser.role}</span>}
           {isAuthed && <span className="table-muted">Сессия: {sessionRemainingMinutes} мин.</span>}
           <button className="ghost" onClick={onLogout}>Выйти</button>
         </div>
@@ -1188,7 +1923,25 @@ export default function App() {
 
       {toasts.length > 0 && <div className={`status-line status-${toasts[toasts.length - 1].kind}`}>{toasts[toasts.length - 1].text}</div>}
 
+      <section className="module-strip">
+        {systemModules.map((moduleItem) => (
+          <article key={moduleItem.code} className={`module-card module-${moduleItem.status.toLowerCase()}`}>
+            <div className="module-card-head">
+              <strong>{moduleItem.title}</strong>
+              <span className={`module-badge module-badge-${moduleItem.status.toLowerCase()}`}>
+                {moduleItem.status === 'ACTIVE' ? 'Активен' : 'Планируется'}
+              </span>
+            </div>
+            <p>{moduleItem.description}</p>
+            {moduleItem.plannedScope && <small>Дальше: {moduleItem.plannedScope}</small>}
+          </article>
+        ))}
+      </section>
+
       <nav className="tabs tabs-admin">
+        <button className={activeTab === 'overview' ? 'active' : ''} onClick={() => setActiveTab('overview')}>
+          Обзор
+        </button>
         <button className={activeTab === 'stock' ? 'active' : ''} onClick={() => setActiveTab('stock')}>Картриджи</button>
         <button className={activeTab === 'departments' ? 'active' : ''} onClick={() => setActiveTab('departments')}>
           Отделы
@@ -1201,6 +1954,23 @@ export default function App() {
         </button>
         <button className={activeTab === 'create' ? 'active' : ''} onClick={() => setActiveTab('create')}>
           Пополнение
+        </button>
+        <button className={activeTab === 'notifications' ? 'active' : ''} onClick={() => setActiveTab('notifications')}>
+          Уведомления
+        </button>
+        <button className={activeTab === 'reports' ? 'active' : ''} onClick={() => setActiveTab('reports')}>
+          Отчеты
+        </button>
+        {authUser?.permissions.canManageUsers && (
+          <button className={activeTab === 'users' ? 'active' : ''} onClick={() => setActiveTab('users')}>
+            Пользователи
+          </button>
+        )}
+        <button className={activeTab === 'inventory' ? 'active' : ''} onClick={() => setActiveTab('inventory')}>
+          Инвентаризация
+        </button>
+        <button className={activeTab === 'hall-requests' ? 'active' : ''} onClick={() => setActiveTab('hall-requests')}>
+          Заявки по залам
         </button>
       </nav>
 
@@ -1648,6 +2418,7 @@ export default function App() {
                 <thead>
                   <tr>
                     <th>Отдел</th>
+                    <th>Кабинет</th>
                     <th>Принтер</th>
                     <th>Слот</th>
                     <th>Нужный картридж</th>
@@ -1661,6 +2432,7 @@ export default function App() {
                   {departmentUsageRows.map((row) => (
                     <tr key={row.id}>
                       <td>{row.departmentName}</td>
+                      <td>{row.roomName}</td>
                       <td>{row.printerName}</td>
                       <td>{row.slotName}</td>
                       <td>{row.cartridgeModelName}</td>
@@ -1767,6 +2539,26 @@ export default function App() {
             </aside>
 
             <aside className="side-card">
+              <p className="eyebrow">Manage Rooms</p>
+              <h3>Кабинеты и залы</h3>
+              <div className="department-mini-list">
+                {rooms.map((room) => (
+                  <article key={room.id} className="department-mini-card">
+                    <strong>{room.name}</strong>
+                    <p>{room.departmentName}</p>
+                    <p>{room.status === 'ACTIVE' ? 'Действует' : 'Демонтирован / не используется'}</p>
+                    <p>{room.comment || 'Без комментария'}</p>
+                    <div className="table-actions">
+                      <button className="ghost" onClick={() => beginRoomEdit(room)}>Изменить</button>
+                      <button className="ghost danger-action" onClick={() => onDeleteRoom(room.id, room.name)}>Удалить</button>
+                    </div>
+                  </article>
+                ))}
+                {rooms.length === 0 && <div className="empty-state">Кабинетов пока нет.</div>}
+              </div>
+            </aside>
+
+            <aside className="side-card">
               <p className="eyebrow">Create Department</p>
               <h3>{editingDepartmentId ? 'Изменить отдел' : 'Добавить отдел'}</h3>
               <p className="table-muted">Отдел содержит только общие сведения. Принтеры и слоты теперь настраиваются отдельно во вкладке <strong>Принтеры</strong>.</p>
@@ -1793,6 +2585,47 @@ export default function App() {
                 </div>
               </form>
             </aside>
+
+            <aside className="side-card">
+              <p className="eyebrow">Create Room</p>
+              <h3>{editingRoomId ? 'Изменить кабинет' : 'Добавить кабинет'}</h3>
+              <form onSubmit={onCreateRoom} className="form-card compact-form">
+                <label>
+                  Название кабинета/зала
+                  <input value={roomName} onChange={(e) => setRoomName(e.target.value)} />
+                </label>
+                <label>
+                  Отдел
+                  <select value={roomDepartmentId} onChange={(e) => setRoomDepartmentId(e.target.value ? Number(e.target.value) : '')}>
+                    <option value="">Выберите...</option>
+                    {userDepartments.map((department) => (
+                      <option key={department.id} value={department.id}>
+                        {department.name}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label>
+                  Статус
+                  <select value={roomStatus} onChange={(e) => setRoomStatus(e.target.value as RoomStatus)}>
+                    <option value="ACTIVE">Действует</option>
+                    <option value="DECOMMISSIONED">Демонтирован / не используется</option>
+                  </select>
+                </label>
+                <label>
+                  Комментарий
+                  <textarea value={roomComment} onChange={(e) => setRoomComment(e.target.value)} />
+                </label>
+                <div className="table-actions">
+                  <button type="submit">{editingRoomId ? 'Сохранить кабинет' : 'Создать кабинет'}</button>
+                  {editingRoomId && (
+                    <button type="button" className="ghost" onClick={resetRoomForm}>
+                      Отмена
+                    </button>
+                  )}
+                </div>
+              </form>
+            </aside>
           </div>
         </section>
       )}
@@ -1812,6 +2645,7 @@ export default function App() {
                 <thead>
                   <tr>
                     <th>Отдел</th>
+                    <th>Кабинет</th>
                     <th>Принтер</th>
                     <th>Тип</th>
                     <th>Слоты</th>
@@ -1822,6 +2656,7 @@ export default function App() {
                   {printers.map((printer) => (
                     <tr key={printer.id}>
                       <td>{printer.departmentName}</td>
+                      <td>{printer.roomName || '-'}</td>
                       <td>{printer.name}</td>
                       <td>{printer.printerType === 'COLOR' ? 'Цветной' : 'Ч/Б'}</td>
                       <td>
@@ -1863,6 +2698,21 @@ export default function App() {
                     {userDepartments.map((department) => (
                       <option key={department.id} value={department.id}>
                         {department.name}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label>
+                  Кабинет (опционально)
+                  <select
+                    value={printerRoomId}
+                    onChange={(e) => setPrinterRoomId(e.target.value ? Number(e.target.value) : '')}
+                    disabled={!printerDepartmentId}
+                  >
+                    <option value="">Не выбран</option>
+                    {availableRoomsForPrinter.map((room) => (
+                      <option key={room.id} value={room.id}>
+                        {room.name}
                       </option>
                     ))}
                   </select>
@@ -1924,6 +2774,55 @@ export default function App() {
               <p className="table-hint">Все действия по остаткам, отделам, заменам и заправкам.</p>
             </div>
           </div>
+          <div className="filters">
+            <label>
+              Дата с
+              <input
+                type="date"
+                value={historyDateFrom}
+                onChange={(event) => setHistoryDateFrom(event.target.value)}
+              />
+            </label>
+            <label>
+              Дата по
+              <input
+                type="date"
+                value={historyDateTo}
+                onChange={(event) => setHistoryDateTo(event.target.value)}
+              />
+            </label>
+            <label>
+              Тип действия
+              <select
+                value={historyActionType}
+                onChange={(event) => setHistoryActionType(event.target.value)}
+              >
+                {ACTION_LOG_TYPE_OPTIONS.map((option) => (
+                  <option key={option.value || 'all'} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label>
+              Кто
+              <input
+                type="text"
+                value={historyActor}
+                placeholder="Например: Администратор"
+                onChange={(event) => setHistoryActor(event.target.value)}
+              />
+            </label>
+            <label>
+              Объект
+              <input
+                type="text"
+                value={historyTargetName}
+                placeholder="Модель, отдел, кабинет"
+                onChange={(event) => setHistoryTargetName(event.target.value)}
+              />
+            </label>
+          </div>
           <div className="table-shell">
             <table className="stock-table">
               <thead>
@@ -1949,6 +2848,412 @@ export default function App() {
             </table>
             {actionLogs.length === 0 && <div className="empty-state">Записей пока нет.</div>}
           </div>
+        </section>
+      )}
+
+      {activeTab === 'notifications' && (
+        <section className="departments-layout">
+          <section className="panel departments-main-panel">
+            <div className="section-heading">
+              <div>
+                <h2>Уведомления по нехватке</h2>
+                <p className="table-hint">Показываются позиции, где остаток достиг или пересек заданный порог.</p>
+              </div>
+            </div>
+            <div className="table-shell">
+              <table className="stock-table">
+                <thead>
+                  <tr>
+                    <th>Отдел</th>
+                    <th>Модель</th>
+                    <th>Текущий остаток</th>
+                    <th>Порог</th>
+                    <th>Источник порога</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {notificationAlerts.map((alert) => (
+                    <tr key={`${alert.departmentId}-${alert.cartridgeModelId}`}>
+                      <td>{alert.departmentName}</td>
+                      <td>{alert.cartridgeModelName}</td>
+                      <td>{alert.currentQuantity}</td>
+                      <td>{alert.thresholdQuantity}</td>
+                      <td>
+                        {alert.source === 'DEPARTMENT'
+                          ? 'Отдел'
+                          : alert.source === 'MODEL_DEFAULT'
+                            ? 'Модель'
+                            : 'Минимум модели'}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              {notificationAlerts.length === 0 && <div className="empty-state">Нехватки по текущим порогам не найдено.</div>}
+            </div>
+          </section>
+
+          <div className="departments-bottom">
+            <aside className="side-card">
+              <p className="eyebrow">Thresholds</p>
+              <h3>Настройки порогов</h3>
+              <div className="department-mini-list">
+                {notificationThresholds.map((item) => (
+                  <article key={item.id} className="department-mini-card">
+                    <strong>{item.cartridgeModelName}</strong>
+                    <p>Отдел: {item.departmentName || 'Все отделы'}</p>
+                    <p>Порог: {item.minimumQuantity}</p>
+                    <p>Статус: {item.active ? 'Активен' : 'Отключен'}</p>
+                    <p>{item.comment || 'Без комментария'}</p>
+                    <div className="table-actions">
+                      <button className="ghost" onClick={() => beginThresholdEdit(item)}>Изменить</button>
+                      <button
+                        className="ghost danger-action"
+                        onClick={() => onDeleteThreshold(item.id, `${item.cartridgeModelName} / ${item.departmentName || 'Все отделы'}`)}
+                      >
+                        Удалить
+                      </button>
+                    </div>
+                  </article>
+                ))}
+                {notificationThresholds.length === 0 && <div className="empty-state">Порогов пока нет.</div>}
+              </div>
+            </aside>
+
+            <aside className="side-card">
+              <p className="eyebrow">Create Threshold</p>
+              <h3>{editingThresholdId ? 'Изменить порог' : 'Добавить порог'}</h3>
+              <form onSubmit={onSaveThreshold} className="form-card compact-form">
+                <label>
+                  Модель картриджа
+                  <select value={thresholdModelId} onChange={(e) => setThresholdModelId(e.target.value ? Number(e.target.value) : '')}>
+                    <option value="">Выберите...</option>
+                    {models.map((model) => (
+                      <option key={model.id} value={model.id}>
+                        {model.name}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label>
+                  Отдел (опционально)
+                  <select value={thresholdDepartmentId} onChange={(e) => setThresholdDepartmentId(e.target.value ? Number(e.target.value) : '')}>
+                    <option value="">Все отделы</option>
+                    {userDepartments.map((department) => (
+                      <option key={department.id} value={department.id}>
+                        {department.name}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label>
+                  Порог остатка
+                  <input
+                    type="number"
+                    min={0}
+                    value={thresholdMinimum}
+                    onChange={(e) => setThresholdMinimum(Number(e.target.value))}
+                  />
+                </label>
+                <label className="checkbox-line">
+                  <input
+                    type="checkbox"
+                    checked={thresholdActive}
+                    onChange={(e) => setThresholdActive(e.target.checked)}
+                  />
+                  <span>Порог активен</span>
+                </label>
+                <label>
+                  Комментарий
+                  <textarea value={thresholdComment} onChange={(e) => setThresholdComment(e.target.value)} />
+                </label>
+                <div className="table-actions">
+                  <button type="submit">{editingThresholdId ? 'Сохранить порог' : 'Создать порог'}</button>
+                  {editingThresholdId && (
+                    <button type="button" className="ghost" onClick={resetThresholdForm}>
+                      Отмена
+                    </button>
+                  )}
+                </div>
+              </form>
+            </aside>
+          </div>
+        </section>
+      )}
+
+      {activeTab === 'reports' && (
+        <section className="panel">
+          <div className="section-heading">
+            <div>
+              <h2>Отчет по расходу картриджей</h2>
+              <p className="table-hint">Просмотр на экране и выгрузка в Excel/PDF за выбранный период.</p>
+            </div>
+          </div>
+
+          <div className="filters">
+            <label>
+              С
+              <input type="date" value={reportDateFrom} onChange={(e) => setReportDateFrom(e.target.value)} />
+            </label>
+            <label>
+              По
+              <input type="date" value={reportDateTo} onChange={(e) => setReportDateTo(e.target.value)} />
+            </label>
+            <div className="table-actions">
+              <button type="button" onClick={() => void loadConsumptionReport()}>Обновить</button>
+              <button type="button" className="ghost" onClick={() => void onExportReportXlsx()}>Excel</button>
+              <button type="button" className="ghost" onClick={() => void onExportReportPdf()}>PDF</button>
+            </div>
+          </div>
+
+          <div className="table-shell">
+            <table className="stock-table">
+              <thead>
+                <tr>
+                  <th>Модель</th>
+                  <th>Установлено</th>
+                  <th>На заправку</th>
+                  <th>Возврат</th>
+                  <th>Списано</th>
+                  <th>Всего операций</th>
+                  <th>Всего шт</th>
+                </tr>
+              </thead>
+              <tbody>
+                {(consumptionReport?.rows ?? []).map((row) => (
+                  <tr key={row.modelName}>
+                    <td>{row.modelName}</td>
+                    <td>{row.installedQuantity}</td>
+                    <td>{row.sentToRefillQuantity}</td>
+                    <td>{row.returnedFromRefillQuantity}</td>
+                    <td>{row.writtenOffQuantity}</td>
+                    <td>{row.totalOperations}</td>
+                    <td>{row.totalQuantity}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            {(consumptionReport?.rows.length ?? 0) === 0 && (
+              <div className="empty-state">За выбранный период данных по расходу не найдено.</div>
+            )}
+          </div>
+
+          {consumptionReport && (
+            <div className="status-line">
+              Итого: {consumptionReport.totalOperations} операций, {consumptionReport.totalQuantity} шт. Период: {consumptionReport.dateFrom} - {consumptionReport.dateTo}
+            </div>
+          )}
+
+          {stockSnapshotReport && (
+            <>
+              <div className="filters">
+                <span className="status-badge status-ready">На складе: {stockSnapshotReport.totalInStock}</span>
+                <span className="status-badge status-on_refill">На заправке: {stockSnapshotReport.totalOnRefill}</span>
+                <span className="status-badge status-installed">Установлено: {stockSnapshotReport.totalInstalled}</span>
+                <span className="status-badge status-written_off">Списано: {stockSnapshotReport.totalWrittenOff}</span>
+              </div>
+
+              <div className="table-shell">
+                <table className="stock-table">
+                  <thead>
+                    <tr>
+                      <th>Отдел</th>
+                      <th>На складе</th>
+                      <th>На заправке</th>
+                      <th>Установлено</th>
+                      <th>Списано</th>
+                      <th>Всего</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {stockSnapshotReport.byDepartment.map((row) => (
+                      <tr key={row.departmentId}>
+                        <td>{row.departmentName}</td>
+                        <td>{row.inStockQuantity}</td>
+                        <td>{row.onRefillQuantity}</td>
+                        <td>{row.installedQuantity}</td>
+                        <td>{row.writtenOffQuantity}</td>
+                        <td>{row.totalQuantity}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+
+              <div className="table-shell">
+                <table className="stock-table">
+                  <thead>
+                    <tr>
+                      <th>Модель картриджа</th>
+                      <th>На складе</th>
+                      <th>На заправке</th>
+                      <th>Установлено</th>
+                      <th>Списано</th>
+                      <th>Всего</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {stockSnapshotReport.byModel.map((row) => (
+                      <tr key={row.cartridgeModelId}>
+                        <td>{row.cartridgeModelName}</td>
+                        <td>{row.inStockQuantity}</td>
+                        <td>{row.onRefillQuantity}</td>
+                        <td>{row.installedQuantity}</td>
+                        <td>{row.writtenOffQuantity}</td>
+                        <td>{row.totalQuantity}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+
+              <div className="table-shell">
+                <table className="stock-table">
+                  <thead>
+                    <tr>
+                      <th>Кабинет</th>
+                      <th>На складе</th>
+                      <th>На заправке</th>
+                      <th>Установлено</th>
+                      <th>Списано</th>
+                      <th>Всего</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {stockSnapshotReport.byRoom.map((row) => (
+                      <tr key={`${row.roomId ?? 'none'}-${row.roomName}`}>
+                        <td>{row.roomName}</td>
+                        <td>{row.inStockQuantity}</td>
+                        <td>{row.onRefillQuantity}</td>
+                        <td>{row.installedQuantity}</td>
+                        <td>{row.writtenOffQuantity}</td>
+                        <td>{row.totalQuantity}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+
+              <div className="table-shell">
+                <table className="stock-table">
+                  <thead>
+                    <tr>
+                      <th>Тип картриджа</th>
+                      <th>На складе</th>
+                      <th>На заправке</th>
+                      <th>Установлено</th>
+                      <th>Списано</th>
+                      <th>Всего</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {stockSnapshotReport.byType.map((row) => (
+                      <tr key={row.cartridgeType}>
+                        <td>{row.cartridgeType}</td>
+                        <td>{row.inStockQuantity}</td>
+                        <td>{row.onRefillQuantity}</td>
+                        <td>{row.installedQuantity}</td>
+                        <td>{row.writtenOffQuantity}</td>
+                        <td>{row.totalQuantity}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </>
+          )}
+        </section>
+      )}
+
+      {activeTab === 'users' && authUser?.permissions.canManageUsers && (
+        <section className="departments-layout">
+          <section className="panel departments-main-panel">
+            <div className="section-heading">
+              <div>
+                <h2>Пользователи системы</h2>
+                <p className="table-hint">Управление логинами, ролями и активностью учетных записей.</p>
+              </div>
+            </div>
+            <div className="table-shell">
+              <table className="stock-table">
+                <thead>
+                  <tr>
+                    <th>Логин</th>
+                    <th>ФИО</th>
+                    <th>Роль</th>
+                    <th>Статус</th>
+                    <th>Действия</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {users.map((user) => (
+                    <tr key={user.id}>
+                      <td>{user.username}</td>
+                      <td>{user.fullName}</td>
+                      <td>{user.role}</td>
+                      <td>{user.active ? 'Активен' : 'Отключен'}</td>
+                      <td>
+                        <button type="button" className="ghost" onClick={() => beginUserEdit(user)}>
+                          Изменить
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              {users.length === 0 && <div className="empty-state">Пользователей пока нет.</div>}
+            </div>
+          </section>
+
+          <aside className="side-card">
+            <p className="eyebrow">User Form</p>
+            <h3>{editingUserId ? 'Изменить пользователя' : 'Новый пользователь'}</h3>
+            <form className="form-card compact-form" onSubmit={onSaveUser}>
+              <label>
+                Логин
+                <input value={userLogin} onChange={(e) => setUserLogin(e.target.value)} />
+              </label>
+              <label>
+                ФИО
+                <input value={userFullName} onChange={(e) => setUserFullName(e.target.value)} />
+              </label>
+              <label>
+                Роль
+                <select value={userRole} onChange={(e) => setUserRole(e.target.value as UserRole)}>
+                  {USER_ROLE_OPTIONS.map((roleOption) => (
+                    <option key={roleOption.value} value={roleOption.value}>
+                      {roleOption.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="checkbox-line">
+                <input
+                  type="checkbox"
+                  checked={userActive}
+                  onChange={(e) => setUserActive(e.target.checked)}
+                />
+                <span>Пользователь активен</span>
+              </label>
+              <label>
+                {editingUserId ? 'Новый пароль (опционально)' : 'Пароль'}
+                <input
+                  type="password"
+                  value={userPassword}
+                  onChange={(e) => setUserPassword(e.target.value)}
+                  placeholder={editingUserId ? 'Оставьте пустым, чтобы не менять' : 'Введите пароль'}
+                />
+              </label>
+              <div className="table-actions">
+                <button type="submit">{editingUserId ? 'Сохранить' : 'Создать'}</button>
+                {editingUserId && (
+                  <button type="button" className="ghost" onClick={resetUserForm}>
+                    Отмена
+                  </button>
+                )}
+              </div>
+            </form>
+          </aside>
         </section>
       )}
 
@@ -2174,6 +3479,411 @@ export default function App() {
               </section>
             </div>
           </div>
+        </section>
+      )}
+
+      {activeTab === 'inventory' && (
+        <section className="departments-layout">
+          <section className="panel departments-main-panel">
+            <div className="section-heading">
+              <div>
+                <h2>Инвентаризация</h2>
+                <p className="table-hint">Учет активов отеля по отделам и кабинетам.</p>
+              </div>
+            </div>
+            <div className="filters">
+              <label>
+                Отдел
+                <select
+                  value={assetFilterDepartmentId}
+                  onChange={(e) => setAssetFilterDepartmentId(e.target.value ? Number(e.target.value) : '')}
+                >
+                  <option value="">Все отделы</option>
+                  {userDepartments.map((department) => (
+                    <option key={department.id} value={department.id}>
+                      {department.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                Кабинет
+                <select
+                  value={assetFilterRoomId}
+                  onChange={(e) => setAssetFilterRoomId(e.target.value ? Number(e.target.value) : '')}
+                >
+                  <option value="">Все кабинеты</option>
+                  {activeRooms.map((room) => (
+                    <option key={room.id} value={room.id}>
+                      {room.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                Статус
+                <select value={assetFilterStatus} onChange={(e) => setAssetFilterStatus(e.target.value as InventoryAssetStatus | '')}>
+                  <option value="">Все статусы</option>
+                  {INVENTORY_STATUS_OPTIONS.map((statusOption) => (
+                    <option key={statusOption.value} value={statusOption.value}>
+                      {statusOption.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </div>
+            <div className="table-shell">
+              <table className="stock-table">
+                <thead>
+                  <tr>
+                    <th>Инв. номер</th>
+                    <th>Наименование</th>
+                    <th>Категория</th>
+                    <th>Отдел</th>
+                    <th>Кабинет</th>
+                    <th>Статус</th>
+                    <th>Кол-во</th>
+                    <th>Действия</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {inventoryAssets.map((asset) => (
+                    <tr key={asset.id}>
+                      <td>{asset.inventoryCode}</td>
+                      <td>{asset.name}</td>
+                      <td>{asset.category || '-'}</td>
+                      <td>{asset.departmentName || '-'}</td>
+                      <td>{asset.roomName || '-'}</td>
+                      <td>{INVENTORY_STATUS_OPTIONS.find((item) => item.value === asset.status)?.label || asset.status}</td>
+                      <td>{asset.quantity}</td>
+                      <td>
+                        <div className="table-actions">
+                          <button className="ghost" type="button" onClick={() => beginAssetEdit(asset)}>
+                            Изменить
+                          </button>
+                          <button className="ghost" type="button" onClick={() => beginAssetTransfer(asset)}>
+                            Переместить
+                          </button>
+                          <button className="ghost danger-action" type="button" onClick={() => onDeleteInventoryAsset(asset.id, asset.name)}>
+                            Удалить
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              {inventoryAssets.length === 0 && <div className="empty-state">Активов пока нет.</div>}
+            </div>
+          </section>
+          <aside className="side-card">
+            <p className="eyebrow">Inventory Form</p>
+            <h3>{editingAssetId ? 'Изменить актив' : 'Добавить актив'}</h3>
+            <form className="form-card compact-form" onSubmit={onSaveInventoryAsset}>
+              <label>
+                Инвентарный номер
+                <input value={assetInventoryCode} onChange={(e) => setAssetInventoryCode(e.target.value)} />
+              </label>
+              <label>
+                Наименование
+                <input value={assetName} onChange={(e) => setAssetName(e.target.value)} />
+              </label>
+              <label>
+                Категория
+                <input value={assetCategory} onChange={(e) => setAssetCategory(e.target.value)} />
+              </label>
+              <label>
+                Отдел
+                <select value={assetDepartmentId} onChange={(e) => setAssetDepartmentId(e.target.value ? Number(e.target.value) : '')}>
+                  <option value="">Не указан</option>
+                  {userDepartments.map((department) => (
+                    <option key={department.id} value={department.id}>
+                      {department.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                Кабинет
+                <select value={assetRoomId} onChange={(e) => setAssetRoomId(e.target.value ? Number(e.target.value) : '')}>
+                  <option value="">Не указан</option>
+                  {(assetDepartmentId ? availableRoomsForAsset : activeRooms).map((room) => (
+                    <option key={room.id} value={room.id}>
+                      {room.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                Статус
+                <select value={assetStatus} onChange={(e) => setAssetStatus(e.target.value as InventoryAssetStatus)}>
+                  {INVENTORY_STATUS_OPTIONS.map((statusOption) => (
+                    <option key={statusOption.value} value={statusOption.value}>
+                      {statusOption.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                Количество
+                <input type="number" min={0} value={assetQuantity} onChange={(e) => setAssetQuantity(Number(e.target.value))} />
+              </label>
+              <label>
+                Комментарий
+                <textarea value={assetComment} onChange={(e) => setAssetComment(e.target.value)} />
+              </label>
+              <div className="table-actions">
+                <button type="submit">{editingAssetId ? 'Сохранить актив' : 'Создать актив'}</button>
+                {editingAssetId && (
+                  <button type="button" className="ghost" onClick={resetAssetForm}>
+                    Отмена
+                  </button>
+                )}
+              </div>
+            </form>
+
+            <form className="form-card compact-form" onSubmit={onTransferInventoryAsset}>
+              <h3>Перемещение актива</h3>
+              <label>
+                Актив
+                <select value={transferAssetId} onChange={(e) => setTransferAssetId(e.target.value ? Number(e.target.value) : '')}>
+                  <option value="">Выберите актив</option>
+                  {inventoryAssets.map((asset) => (
+                    <option key={asset.id} value={asset.id}>
+                      {asset.inventoryCode} · {asset.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                Отдел назначения
+                <select
+                  value={transferDepartmentId}
+                  onChange={(e) => setTransferDepartmentId(e.target.value ? Number(e.target.value) : '')}
+                >
+                  <option value="">Без отдела</option>
+                  {userDepartments.map((department) => (
+                    <option key={department.id} value={department.id}>
+                      {department.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                Кабинет назначения
+                <select value={transferRoomId} onChange={(e) => setTransferRoomId(e.target.value ? Number(e.target.value) : '')}>
+                  <option value="">Без кабинета</option>
+                  {(transferDepartmentId ? availableRoomsForTransfer : activeRooms).map((room) => (
+                    <option key={room.id} value={room.id}>
+                      {room.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                Дата/время операции (опционально)
+                <input type="datetime-local" value={transferMovedAt} onChange={(e) => setTransferMovedAt(e.target.value)} />
+              </label>
+              <label>
+                Исполнитель
+                <input value={transferActor} onChange={(e) => setTransferActor(e.target.value)} />
+              </label>
+              <label>
+                Комментарий
+                <textarea value={transferComment} onChange={(e) => setTransferComment(e.target.value)} />
+              </label>
+              <div className="table-actions">
+                <button type="submit">Переместить актив</button>
+                <button type="button" className="ghost" onClick={resetTransferForm}>
+                  Очистить
+                </button>
+              </div>
+            </form>
+
+            <section className="form-card">
+              <h3>История перемещений</h3>
+              <label>
+                Фильтр по активу
+                <select
+                  value={assetMovementFilterAssetId}
+                  onChange={(e) => setAssetMovementFilterAssetId(e.target.value ? Number(e.target.value) : '')}
+                >
+                  <option value="">Все активы</option>
+                  {inventoryAssets.map((asset) => (
+                    <option key={asset.id} value={asset.id}>
+                      {asset.inventoryCode} · {asset.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <div className="department-mini-list">
+                {inventoryMovements.slice(0, 12).map((movement) => (
+                  <article key={movement.id} className="department-mini-card">
+                    <strong>{movement.assetInventoryCode} · {movement.assetName}</strong>
+                    <p>{formatLocation(movement.fromDepartmentName, movement.fromRoomName)} {'->'} {formatLocation(movement.toDepartmentName, movement.toRoomName)}</p>
+                    <p>{formatDateTime(movement.movedAt)} · {movement.actor || 'Система'}</p>
+                    <p>{movement.comment || 'Без комментария'}</p>
+                  </article>
+                ))}
+                {inventoryMovements.length === 0 && <div className="empty-state">Перемещений пока нет.</div>}
+              </div>
+            </section>
+          </aside>
+        </section>
+      )}
+
+      {activeTab === 'hall-requests' && (
+        <section className="departments-layout">
+          <section className="panel departments-main-panel">
+            <div className="section-heading">
+              <div>
+                <h2>Заявки по залам</h2>
+                <p className="table-hint">Очередь заявок по кабинетам и залам с приоритетом и статусом.</p>
+              </div>
+            </div>
+            <div className="filters">
+              <label>
+                Кабинет
+                <select value={hallFilterRoomId} onChange={(e) => setHallFilterRoomId(e.target.value ? Number(e.target.value) : '')}>
+                  <option value="">Все кабинеты</option>
+                  {activeRooms.map((room) => (
+                    <option key={room.id} value={room.id}>
+                      {room.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                Статус
+                <select value={hallFilterStatus} onChange={(e) => setHallFilterStatus(e.target.value as HallRequestStatus | '')}>
+                  <option value="">Все статусы</option>
+                  {HALL_REQUEST_STATUS_OPTIONS.map((statusOption) => (
+                    <option key={statusOption.value} value={statusOption.value}>
+                      {statusOption.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="checkbox-line">
+                <input
+                  type="checkbox"
+                  checked={hallOverdueOnly}
+                  onChange={(e) => setHallOverdueOnly(e.target.checked)}
+                />
+                <span>Только просроченные SLA</span>
+              </label>
+            </div>
+            <div className="status-line">
+              Просрочено: {hallRequests.filter((request) => request.slaOverdue).length} · Срочные: {hallRequests.filter((request) => request.priority === 'URGENT').length}
+            </div>
+            <div className="table-shell">
+              <table className="stock-table">
+                <thead>
+                  <tr>
+                    <th>Когда</th>
+                    <th>Кабинет</th>
+                    <th>Заявитель</th>
+                    <th>Тема</th>
+                    <th>Приоритет</th>
+                    <th>Статус</th>
+                    <th>SLA дедлайн</th>
+                    <th>До SLA</th>
+                    <th>Действия</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {hallRequests.map((request) => (
+                    <tr key={request.id}>
+                      <td>{formatDateTime(request.requestedAt)}</td>
+                      <td>{request.roomName}</td>
+                      <td>{request.requesterName}</td>
+                      <td>{request.title}</td>
+                      <td>{HALL_REQUEST_PRIORITY_OPTIONS.find((item) => item.value === request.priority)?.label || request.priority}</td>
+                      <td>{HALL_REQUEST_STATUS_OPTIONS.find((item) => item.value === request.status)?.label || request.status}</td>
+                      <td>{formatDateTime(request.slaDueAt)}</td>
+                      <td className={request.slaOverdue ? 'danger-text' : 'table-muted'}>
+                        {request.slaOverdue
+                          ? `Просрочено ${Math.abs(request.slaMinutesRemaining)} мин`
+                          : `${request.slaMinutesRemaining} мин`}
+                      </td>
+                      <td>
+                        <div className="table-actions">
+                          <button className="ghost" type="button" onClick={() => beginHallRequestEdit(request)}>
+                            Изменить
+                          </button>
+                          <button className="ghost danger-action" type="button" onClick={() => onDeleteHallRequest(request.id, request.title)}>
+                            Удалить
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              {hallRequests.length === 0 && <div className="empty-state">Заявок пока нет.</div>}
+            </div>
+          </section>
+          <aside className="side-card">
+            <p className="eyebrow">Hall Request Form</p>
+            <h3>{editingHallRequestId ? 'Изменить заявку' : 'Новая заявка'}</h3>
+            <form className="form-card compact-form" onSubmit={onSaveHallRequest}>
+              <label>
+                Кабинет
+                <select value={hallRoomId} onChange={(e) => setHallRoomId(e.target.value ? Number(e.target.value) : '')}>
+                  <option value="">Выберите кабинет</option>
+                  {activeRooms.map((room) => (
+                    <option key={room.id} value={room.id}>
+                      {room.departmentName} / {room.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                Заявитель
+                <input value={hallRequesterName} onChange={(e) => setHallRequesterName(e.target.value)} />
+              </label>
+              <label>
+                Тема
+                <input value={hallTitle} onChange={(e) => setHallTitle(e.target.value)} />
+              </label>
+              <label>
+                Описание
+                <textarea value={hallDescription} onChange={(e) => setHallDescription(e.target.value)} />
+              </label>
+              <label>
+                Приоритет
+                <select value={hallPriority} onChange={(e) => setHallPriority(e.target.value as HallRequestPriority)}>
+                  {HALL_REQUEST_PRIORITY_OPTIONS.map((priorityOption) => (
+                    <option key={priorityOption.value} value={priorityOption.value}>
+                      {priorityOption.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                Статус
+                <select value={hallStatus} onChange={(e) => setHallStatus(e.target.value as HallRequestStatus)}>
+                  {HALL_REQUEST_STATUS_OPTIONS.map((statusOption) => (
+                    <option key={statusOption.value} value={statusOption.value}>
+                      {statusOption.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                Плановая дата (опционально)
+                <input type="datetime-local" value={hallPlannedAt} onChange={(e) => setHallPlannedAt(e.target.value)} />
+              </label>
+              <div className="table-actions">
+                <button type="submit">{editingHallRequestId ? 'Сохранить заявку' : 'Создать заявку'}</button>
+                {editingHallRequestId && (
+                  <button type="button" className="ghost" onClick={resetHallRequestForm}>
+                    Отмена
+                  </button>
+                )}
+              </div>
+            </form>
+          </aside>
         </section>
       )}
 

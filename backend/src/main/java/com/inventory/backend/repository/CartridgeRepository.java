@@ -17,6 +17,7 @@ public interface CartridgeRepository extends JpaRepository<Cartridge, Long> {
     List<Cartridge> findByDepartmentId(Long departmentId);
 
     List<Cartridge> findByStatus(CartridgeStatus status);
+    List<Cartridge> findByStatusAndEmptyFalse(CartridgeStatus status);
 
     List<Cartridge> findByDepartmentIdAndStatus(Long departmentId, CartridgeStatus status);
 

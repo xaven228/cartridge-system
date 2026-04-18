@@ -15,6 +15,7 @@ import com.inventory.backend.repository.CartridgeRepository;
 import com.inventory.backend.repository.DepartmentRepository;
 import com.inventory.backend.repository.PrinterInstallationRepository;
 import com.inventory.backend.repository.PrinterRepository;
+import com.inventory.backend.repository.RoomRepository;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -31,6 +32,7 @@ public class DepartmentService {
     private final CartridgeModelRepository cartridgeModelRepository;
     private final PrinterInstallationRepository printerInstallationRepository;
     private final PrinterRepository printerRepository;
+    private final RoomRepository roomRepository;
     private final ActionLogService actionLogService;
 
     @Transactional(readOnly = true)
@@ -95,6 +97,9 @@ public class DepartmentService {
         if (cartridgeRepository.countByDepartmentId(id) > 0) {
             throw new ConflictException("Нельзя удалить отдел, пока в нем есть картриджные остатки");
         }
+        if (roomRepository.countByDepartmentId(id) > 0) {
+            throw new ConflictException("Нельзя удалить отдел, пока в нем есть кабинеты/залы");
+        }
 
         actionLogService.log(
                 ActionLogType.DEPARTMENT_DELETED,
@@ -128,6 +133,8 @@ public class DepartmentService {
                 .map(printer -> DepartmentPrinterResponse.builder()
                         .id(printer.getId())
                         .name(printer.getName())
+                        .roomId(printer.getRoom() != null ? printer.getRoom().getId() : null)
+                        .roomName(printer.getRoom() != null ? printer.getRoom().getName() : null)
                         .printerType(printer.getPrinterType())
                         .slots(printer.getSlots().stream()
                                 .map(slot -> {

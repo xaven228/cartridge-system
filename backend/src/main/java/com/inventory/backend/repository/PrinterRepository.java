@@ -9,4 +9,5 @@ import java.util.List;
 public interface PrinterRepository extends JpaRepository<Printer, Long> {
     List<Printer> findByDepartmentIdOrderByIdAsc(Long departmentId);
     long countByPrinterType(PrinterType printerType);
+    boolean existsByRoomId(Long roomId);
 }

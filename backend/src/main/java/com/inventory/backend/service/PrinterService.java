@@ -10,11 +10,13 @@ import com.inventory.backend.entity.Printer;
 import com.inventory.backend.entity.PrinterInstallation;
 import com.inventory.backend.entity.PrinterSlot;
 import com.inventory.backend.entity.PrinterType;
+import com.inventory.backend.entity.Room;
 import com.inventory.backend.exception.NotFoundException;
 import com.inventory.backend.repository.CartridgeModelRepository;
 import com.inventory.backend.repository.DepartmentRepository;
 import com.inventory.backend.repository.PrinterInstallationRepository;
 import com.inventory.backend.repository.PrinterRepository;
+import com.inventory.backend.repository.RoomRepository;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -30,6 +32,7 @@ public class PrinterService {
     private final DepartmentRepository departmentRepository;
     private final CartridgeModelRepository cartridgeModelRepository;
     private final PrinterInstallationRepository printerInstallationRepository;
+    private final RoomRepository roomRepository;
     private final ActionLogService actionLogService;
 
     @Transactional(readOnly = true)
@@ -43,10 +46,12 @@ public class PrinterService {
     public PrinterResponse create(UpsertPrinterRequest request) {
         Department department = departmentRepository.findById(request.getDepartmentId())
                 .orElseThrow(() -> new NotFoundException("Отдел не найден: " + request.getDepartmentId()));
+        Room room = resolveRoom(request.getRoomId(), department);
 
         Printer printer = Printer.builder()
                 .name(request.getName().trim())
                 .department(department)
+                .room(room)
                 .printerType(request.getPrinterType())
                 .slots(new ArrayList<>())
                 .build();
@@ -68,9 +73,11 @@ public class PrinterService {
 
         Department department = departmentRepository.findById(request.getDepartmentId())
                 .orElseThrow(() -> new NotFoundException("Отдел не найден: " + request.getDepartmentId()));
+        Room room = resolveRoom(request.getRoomId(), department);
 
         printer.setName(request.getName().trim());
         printer.setDepartment(department);
+        printer.setRoom(room);
         printer.setPrinterType(request.getPrinterType());
         applySlots(printer, request);
         Printer saved = printerRepository.save(printer);
@@ -124,11 +131,26 @@ public class PrinterService {
                 .name(printer.getName())
                 .departmentId(printer.getDepartment() != null ? printer.getDepartment().getId() : null)
                 .departmentName(printer.getDepartment() != null ? printer.getDepartment().getName() : null)
+                .roomId(printer.getRoom() != null ? printer.getRoom().getId() : null)
+                .roomName(printer.getRoom() != null ? printer.getRoom().getName() : null)
                 .printerType(printer.getPrinterType())
                 .slots(printer.getSlots().stream()
                         .map(this::toSlotResponse)
                         .toList())
                 .build();
+    }
+
+    private Room resolveRoom(Long roomId, Department department) {
+        if (roomId == null) {
+            return null;
+        }
+
+        Room room = roomRepository.findById(roomId)
+                .orElseThrow(() -> new NotFoundException("Кабинет не найден: " + roomId));
+        if (room.getDepartment() == null || !room.getDepartment().getId().equals(department.getId())) {
+            throw new NotFoundException("Кабинет не относится к выбранному отделу");
+        }
+        return room;
     }
 
     public PrinterSlotResponse toSlotResponse(PrinterSlot slot) {

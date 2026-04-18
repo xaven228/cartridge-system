@@ -319,6 +319,67 @@ strong {
   color: #ffb3b3;
 }
 
+.module-strip {
+  display: grid;
+  gap: 10px;
+  margin-bottom: 14px;
+}
+
+.module-card {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-2);
+  padding: 10px 12px;
+}
+
+.module-card-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.module-card p {
+  margin: 8px 0 0;
+}
+
+.module-card small {
+  display: block;
+  margin-top: 6px;
+  color: var(--text-soft);
+}
+
+.module-badge {
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  padding: 2px 8px;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.module-badge-active {
+  border-color: rgba(79, 194, 122, 0.5);
+  color: #b9efc8;
+}
+
+.module-badge-planned {
+  border-color: rgba(237, 170, 58, 0.5);
+  color: #ffd8a6;
+}
+
+.planned-state {
+  text-align: left;
+}
+
+.planned-list {
+  margin: 8px 0 0;
+  padding-left: 18px;
+}
+
+.planned-list li + li {
+  margin-top: 6px;
+}
+
 .filters {
   margin: 14px 0;
 }

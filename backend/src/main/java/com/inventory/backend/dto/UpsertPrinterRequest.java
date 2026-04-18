@@ -20,6 +20,8 @@ public class UpsertPrinterRequest {
     @NotNull
     private Long departmentId;
 
+    private Long roomId;
+
     @NotNull
     private PrinterType printerType;
 

@@ -19,6 +19,8 @@ public class DepartmentPrinterResponse {
 
     private Long id;
     private String name;
+    private Long roomId;
+    private String roomName;
     private PrinterType printerType;
     private List<PrinterSlotResponse> slots;
 }
