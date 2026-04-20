@@ -4,6 +4,7 @@ import com.inventory.backend.dto.AuthResponse
 import com.inventory.backend.dto.AuthUserResponse
 import com.inventory.backend.dto.LoginRequest
 import com.inventory.backend.service.AuthService
+import jakarta.servlet.http.HttpServletRequest
 import jakarta.validation.Valid
 import org.springframework.web.bind.annotation.CrossOrigin
 import org.springframework.web.bind.annotation.GetMapping
@@ -20,7 +21,11 @@ class AuthController(
 ) {
 
     @PostMapping("/login")
-    fun login(@Valid @RequestBody request: LoginRequest): AuthResponse = authService.login(request)
+    fun login(@Valid @RequestBody request: LoginRequest, httpRequest: HttpServletRequest): AuthResponse =
+        authService.login(request, httpRequest)
+
+    @PostMapping("/refresh")
+    fun refresh(): AuthResponse = authService.refresh()
 
     @GetMapping("/me")
     fun me(): AuthUserResponse = authService.me()

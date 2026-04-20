@@ -33,10 +33,18 @@ class JwtAuthFilter(
                 val user = appUserRepository.findById(userId).orElse(null)
                 if (user != null && user.active == true) {
                     val principal = AuthenticatedUser(
-                        id = user.id,
+                        id = user.id!!,
                         username = user.username,
                         fullName = user.fullName,
                         role = user.role,
+                        canViewCatalog = user.canViewCatalog == true,
+                        canEditCatalog = user.canEditCatalog == true,
+                        canOperate = user.canOperate == true,
+                        canViewLogs = user.canViewLogs == true,
+                        canExportReports = user.canExportReports == true,
+                        canManageUsers = user.canManageUsers == true,
+                        canManageThresholds = user.canManageThresholds == true,
+                        canManualDatetime = user.canManualDatetime == true,
                     )
                     val auth = UsernamePasswordAuthenticationToken(
                         principal,

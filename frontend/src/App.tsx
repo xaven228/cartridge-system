@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type { FormEvent } from 'react'
 import {
   adjustQuantity,
@@ -13,6 +13,8 @@ import {
   createPrinter,
   downloadConsumptionReportPdf,
   downloadConsumptionReportXlsx,
+  downloadStockSnapshotReportPdf,
+  downloadStockSnapshotReportXlsx,
   deleteCartridge,
   deleteCartridgeModel,
   deleteDepartment,
@@ -34,13 +36,14 @@ import {
   getNotificationThresholds,
   getPrinters,
   getRooms,
-  getRefillHistory,
   getSystemModules,
   getUsers,
   installCartridge,
   markCartridgeEmpty,
   replaceCartridge,
   removeCartridgeInstallation,
+  refreshAuthSession,
+  setUnauthorizedHandler,
   returnFromRefill,
   setAuthToken,
   sendToRefill,
@@ -56,15 +59,17 @@ import {
   updateUser,
   writeOff,
 } from './api'
-import type { ActionLogRecord, AuthUser, Cartridge, CartridgeModel, CartridgeStatus, Department, HallRequest, HallRequestPriority, HallRequestStatus, InventoryAsset, InventoryAssetStatus, NotificationAlert, NotificationThreshold, Printer, PrinterType, RefillHistoryRecord, Room, RoomStatus, UpsertHallRequestPayload, UpsertInventoryAssetPayload, UserAdminRecord, UserRole } from './api'
+import type { ActionLogRecord, AuthUser, Cartridge, CartridgeModel, CartridgeStatus, Department, DepartmentStatus, HallRequest, HallRequestPriority, HallRequestStatus, InventoryAsset, InventoryAssetStatus, NotificationAlert, NotificationThreshold, Printer, PrinterColorMode, PrinterDeviceType, PrinterStatus, Room, RoomStatus, UpsertHallRequestPayload, UpsertInventoryAssetPayload, UserAdminRecord, UserPermissions, UserRole } from './api'
 import type { InventoryAssetMovement, TransferInventoryAssetPayload } from './api'
 import type { ConsumptionReport, StockSnapshotReport } from './api'
 import type { SystemModule } from './api'
 
-const STATUS_LIST: CartridgeStatus[] = ['IN_STOCK', 'INSTALLED', 'ON_REFILL', 'WRITTEN_OFF']
+const STATUS_LIST: CartridgeStatus[] = ['IN_STOCK', 'RESERVE', 'INSTALLED', 'ON_REFILL', 'WRITTEN_OFF']
 const PAGE_SIZE = 8
 const STOCK_DEPARTMENT_NAME = 'Склад'
 const AUTH_STORAGE_KEY = 'cartridge-auth-session'
+const SESSION_REFRESH_WINDOW_MS = 5 * 60 * 1000
+const SESSION_ACTIVITY_THROTTLE_MS = 15 * 1000
 
 type SortKey = 'departmentName' | 'status' | 'quantity' | 'refillCount'
 type ToastKind = 'success' | 'error'
@@ -73,6 +78,11 @@ type DetailAction = 'send' | 'return' | 'writeoff' | null
 type RemovalOutcome = 'STOCK' | 'REFILL' | 'WRITE_OFF'
 type BatchEntry = { quantity: number; comment: string }
 type PrinterSlotForm = { name: string; cartridgeModelId: number | '' }
+type WriteOffRequest = { source: 'stock' | 'detail'; cartridgeId: number; label: string }
+type ReportSummaryView = 'department' | 'model' | 'room' | 'type' | 'printer'
+type ReportItemsView = 'stock' | 'reserve' | 'refill' | 'writtenOff'
+type ModelCatalogTypeFilter = 'all' | 'refillable' | 'disposable'
+type ModelCatalogBalanceFilter = 'all' | 'deficit' | 'minimum' | 'surplus'
 type DeleteTarget =
   | { kind: 'printer'; id: number; label: string }
   | { kind: 'department'; id: number; label: string }
@@ -91,6 +101,7 @@ interface Toast {
 
 const STATUS_LABELS: Record<CartridgeStatus, string> = {
   IN_STOCK: 'На складе',
+  RESERVE: 'Резерв',
   INSTALLED: 'Установлен',
   ON_REFILL: 'На заправке',
   WRITTEN_OFF: 'Списан',
@@ -98,6 +109,7 @@ const STATUS_LABELS: Record<CartridgeStatus, string> = {
 
 const STATUS_TONES: Record<CartridgeStatus, string> = {
   IN_STOCK: 'status-in_stock',
+  RESERVE: 'status-reserve',
   INSTALLED: 'status-installed',
   ON_REFILL: 'status-on_refill',
   WRITTEN_OFF: 'status-written_off',
@@ -105,6 +117,9 @@ const STATUS_TONES: Record<CartridgeStatus, string> = {
 
 const ACTION_LOG_TYPE_OPTIONS: Array<{ value: string; label: string }> = [
   { value: '', label: 'Все действия' },
+  { value: 'USER_LOGIN', label: 'Вход в систему' },
+  { value: 'USER_CREATED', label: 'Создание пользователя' },
+  { value: 'USER_UPDATED', label: 'Изменение пользователя' },
   { value: 'CARTRIDGE_CREATED', label: 'Приход' },
   { value: 'CARTRIDGE_QUANTITY_CHANGED', label: 'Изменение остатка' },
   { value: 'CARTRIDGE_INSTALLED', label: 'Установка' },
@@ -118,9 +133,14 @@ const ACTION_LOG_TYPE_OPTIONS: Array<{ value: string; label: string }> = [
   { value: 'DEPARTMENT_CREATED', label: 'Создание отдела' },
   { value: 'DEPARTMENT_UPDATED', label: 'Изменение отдела' },
   { value: 'DEPARTMENT_DELETED', label: 'Удаление отдела' },
+  { value: 'DEPARTMENT_DECOMMISSIONED', label: 'Вывод отдела из использования' },
   { value: 'ROOM_CREATED', label: 'Создание кабинета' },
   { value: 'ROOM_UPDATED', label: 'Изменение кабинета' },
   { value: 'ROOM_DELETED', label: 'Удаление кабинета' },
+  { value: 'ROOM_DECOMMISSIONED', label: 'Вывод кабинета из использования' },
+  { value: 'PRINTER_CREATED', label: 'Создание принтера' },
+  { value: 'PRINTER_UPDATED', label: 'Изменение принтера' },
+  { value: 'PRINTER_WRITTEN_OFF', label: 'Списание принтера' },
   { value: 'THRESHOLD_CREATED', label: 'Создание порога' },
   { value: 'THRESHOLD_UPDATED', label: 'Изменение порога' },
   { value: 'THRESHOLD_DELETED', label: 'Удаление порога' },
@@ -136,11 +156,64 @@ const ACTION_LOG_TYPE_OPTIONS: Array<{ value: string; label: string }> = [
   { value: 'CARTRIDGE_MODEL_DELETED', label: 'Удаление модели' },
 ]
 
+const ACTION_LOG_ENTITY_OPTIONS: Array<{ value: string; label: string }> = [
+  { value: '', label: 'Все сущности' },
+  { value: 'AUTH', label: 'Авторизация' },
+  { value: 'USER', label: 'Пользователь' },
+  { value: 'DEPARTMENT', label: 'Отдел' },
+  { value: 'ROOM', label: 'Кабинет' },
+  { value: 'PRINTER', label: 'Принтер' },
+  { value: 'CARTRIDGE', label: 'Картридж' },
+  { value: 'CARTRIDGE_MODEL', label: 'Модель картриджа' },
+  { value: 'NOTIFICATION_THRESHOLD', label: 'Порог уведомления' },
+  { value: 'INVENTORY_ASSET', label: 'Инвентарный актив' },
+  { value: 'HALL_REQUEST', label: 'Заявка по залу' },
+]
+
+const ACTION_LOG_RESULT_OPTIONS: Array<{ value: string; label: string }> = [
+  { value: '', label: 'Любой результат' },
+  { value: 'SUCCESS', label: 'Успешно' },
+  { value: 'FAILED', label: 'Ошибка' },
+]
+
 const USER_ROLE_OPTIONS: Array<{ value: UserRole; label: string }> = [
   { value: 'ADMIN', label: 'Администратор' },
   { value: 'OPERATOR', label: 'Оператор' },
   { value: 'VIEWER', label: 'Наблюдатель' },
 ]
+
+const DEFAULT_PERMISSIONS_BY_ROLE: Record<UserRole, UserPermissions> = {
+  ADMIN: {
+    canViewCatalog: true,
+    canEditCatalog: true,
+    canOperate: true,
+    canViewLogs: true,
+    canExportReports: true,
+    canManageUsers: true,
+    canManageThresholds: true,
+    canManualDatetime: true,
+  },
+  OPERATOR: {
+    canViewCatalog: true,
+    canEditCatalog: true,
+    canOperate: true,
+    canViewLogs: true,
+    canExportReports: false,
+    canManageUsers: false,
+    canManageThresholds: false,
+    canManualDatetime: false,
+  },
+  VIEWER: {
+    canViewCatalog: true,
+    canEditCatalog: false,
+    canOperate: false,
+    canViewLogs: false,
+    canExportReports: false,
+    canManageUsers: false,
+    canManageThresholds: false,
+    canManualDatetime: false,
+  },
+}
 
 const INVENTORY_STATUS_OPTIONS: Array<{ value: InventoryAssetStatus; label: string }> = [
   { value: 'IN_USE', label: 'В использовании' },
@@ -164,6 +237,9 @@ const HALL_REQUEST_STATUS_OPTIONS: Array<{ value: HallRequestStatus; label: stri
 ]
 
 function getStockStateMeta(cartridge: Cartridge): { label: string; tone: string } {
+  if (cartridge.status === 'RESERVE') {
+    return { label: 'Резерв', tone: 'status-reserve' }
+  }
   if (cartridge.status === 'ON_REFILL') {
     return { label: 'На заправке', tone: 'status-on_refill' }
   }
@@ -189,15 +265,38 @@ function sixMonthsAgo(): string {
   return value.toISOString().slice(0, 10)
 }
 
-function formatHistoryStatus(status: string): string {
-  if (status === 'SENT') return 'Отправлен'
-  if (status === 'RETURNED') return 'Возвращен'
-  return status
-}
-
 function clampOperationQuantity(value: number, max: number): number {
   if (!Number.isFinite(value) || value < 1) return 1
   return Math.min(value, Math.max(1, max))
+}
+
+function paginateItems<T>(items: T[], page: number, size = PAGE_SIZE): T[] {
+  const from = (page - 1) * size
+  return items.slice(from, from + size)
+}
+
+function parseCompatiblePrinterModels(value: string): string[] {
+  return value
+    .split('\n')
+    .map((item) => item.trim())
+    .filter(Boolean)
+    .filter((item, index, list) => list.indexOf(item) === index)
+}
+
+function formatCompatiblePrinterModels(values?: string[] | null): string {
+  return (values ?? []).join('\n')
+}
+
+function isCartridgeModelCompatibleWithPrinter(cartridgeModel: CartridgeModel, printerModel: string): boolean {
+  const normalizedPrinterModel = printerModel.trim().toLowerCase()
+  if (!normalizedPrinterModel) return true
+
+  const compatibleModels = (cartridgeModel.compatiblePrinterModels ?? [])
+    .map((item) => item.trim().toLowerCase())
+    .filter(Boolean)
+
+  if (compatibleModels.length === 0) return true
+  return compatibleModels.includes(normalizedPrinterModel)
 }
 
 function formatActionType(actionType: string): string {
@@ -212,12 +311,20 @@ function formatActionType(actionType: string): string {
     CARTRIDGE_MARKED_EMPTY: 'Пометка пустым',
     CARTRIDGE_REFILLABLE_CHANGED: 'Изменение типа',
     CARTRIDGE_DELETED: 'Удаление остатка',
+    USER_LOGIN: 'Вход в систему',
+    USER_CREATED: 'Создание пользователя',
+    USER_UPDATED: 'Изменение пользователя',
     DEPARTMENT_CREATED: 'Создание отдела',
     DEPARTMENT_UPDATED: 'Изменение отдела',
     DEPARTMENT_DELETED: 'Удаление отдела',
+    DEPARTMENT_DECOMMISSIONED: 'Вывод отдела из использования',
     ROOM_CREATED: 'Создание кабинета',
     ROOM_UPDATED: 'Изменение кабинета',
     ROOM_DELETED: 'Удаление кабинета',
+    ROOM_DECOMMISSIONED: 'Вывод кабинета из использования',
+    PRINTER_CREATED: 'Создание принтера',
+    PRINTER_UPDATED: 'Изменение принтера',
+    PRINTER_WRITTEN_OFF: 'Списание принтера',
     THRESHOLD_CREATED: 'Создание порога',
     THRESHOLD_UPDATED: 'Изменение порога',
     THRESHOLD_DELETED: 'Удаление порога',
@@ -233,6 +340,56 @@ function formatActionType(actionType: string): string {
     CARTRIDGE_MODEL_DELETED: 'Удаление модели',
   }
   return labels[actionType] || actionType
+}
+
+function formatActionEntityType(entityType: string): string {
+  const labels: Record<string, string> = {
+    AUTH: 'Авторизация',
+    USER: 'Пользователь',
+    DEPARTMENT: 'Отдел',
+    ROOM: 'Кабинет',
+    PRINTER: 'Принтер',
+    CARTRIDGE: 'Картридж',
+    CARTRIDGE_MODEL: 'Модель картриджа',
+    NOTIFICATION_THRESHOLD: 'Порог уведомления',
+    INVENTORY_ASSET: 'Инвентарный актив',
+    HALL_REQUEST: 'Заявка по залу',
+    SYSTEM: 'Система',
+  }
+  return labels[entityType] || entityType
+}
+
+function formatActionResult(result: string): string {
+  if (result === 'SUCCESS') return 'Успешно'
+  if (result === 'FAILED') return 'Ошибка'
+  return result
+}
+
+function formatPrinterDeviceType(value: PrinterDeviceType): string {
+  return value === 'MFP' ? 'МФУ' : 'Принтер'
+}
+
+function formatPrinterColorMode(value: PrinterColorMode): string {
+  return value === 'COLOR' ? 'Цветной' : 'Ч/Б'
+}
+
+function formatPrinterStatus(value: PrinterStatus): string {
+  if (value === 'IN_STOCK') return 'На складе'
+  if (value === 'IN_REPAIR') return 'В ремонте'
+  if (value === 'WRITTEN_OFF') return 'Списан'
+  return 'В эксплуатации'
+}
+
+function formatDepartmentStatus(value: DepartmentStatus): string {
+  return value === 'DECOMMISSIONED' ? 'Демонтирован / не используется' : 'Действует'
+}
+
+function formatRoomStatus(value: RoomStatus): string {
+  return value === 'DECOMMISSIONED' ? 'Демонтирован / не используется' : 'Действует'
+}
+
+function getStructureStatusTone(value: DepartmentStatus | RoomStatus): string {
+  return value === 'DECOMMISSIONED' ? 'status-decommissioned' : 'status-active'
 }
 
 function formatDate(value?: string | null): string {
@@ -271,13 +428,50 @@ function getDeleteCartridgeHint(cartridge: Cartridge): string {
   return 'Удалить остаток'
 }
 
+function getDeleteDialogMeta(target: DeleteTarget): {
+  title: string
+  subject: string
+  confirmLabel: string
+  description: string
+} {
+  if (target.kind === 'printer') {
+    return {
+      title: 'Списание принтера',
+      subject: `Списать: ${target.label}`,
+      confirmLabel: 'Списать',
+      description: 'Принтер останется в системе и перейдёт в архивный статус.',
+    }
+  }
+  if (target.kind === 'department') {
+    return {
+      title: 'Вывод отдела из использования',
+      subject: `Вывести из использования: ${target.label}`,
+      confirmLabel: 'Вывести из использования',
+      description: 'Отдел не будет удалён физически и перейдёт в статус «Демонтирован / не используется».',
+    }
+  }
+  if (target.kind === 'room') {
+    return {
+      title: 'Вывод кабинета из использования',
+      subject: `Вывести из использования: ${target.label}`,
+      confirmLabel: 'Вывести из использования',
+      description: 'Кабинет останется в системе и перейдёт в статус «Демонтирован / не используется».',
+    }
+  }
+  return {
+    title: 'Удаление',
+    subject: `Удалить: ${target.label}`,
+    confirmLabel: 'Удалить',
+    description: 'Это действие нельзя отменить.',
+  }
+}
+
 export default function App() {
   const [departments, setDepartments] = useState<Department[]>([])
   const [rooms, setRooms] = useState<Room[]>([])
   const [printers, setPrinters] = useState<Printer[]>([])
   const [models, setModels] = useState<CartridgeModel[]>([])
   const [cartridges, setCartridges] = useState<Cartridge[]>([])
-  const [history, setHistory] = useState<RefillHistoryRecord[]>([])
   const [actionLogs, setActionLogs] = useState<ActionLogRecord[]>([])
   const [users, setUsers] = useState<UserAdminRecord[]>([])
   const [systemModules, setSystemModules] = useState<SystemModule[]>([])
@@ -296,9 +490,24 @@ export default function App() {
   const [sortKey, setSortKey] = useState<SortKey>('quantity')
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('asc')
   const [currentPage, setCurrentPage] = useState(1)
+  const [departmentUsageSearch, setDepartmentUsageSearch] = useState('')
+  const [departmentUsageDepartmentFilter, setDepartmentUsageDepartmentFilter] = useState<number | 'all'>('all')
+  const [departmentUsagePage, setDepartmentUsagePage] = useState(1)
+  const [departmentListSearch, setDepartmentListSearch] = useState('')
+  const [departmentListStatusFilter, setDepartmentListStatusFilter] = useState<DepartmentStatus | 'all'>('all')
+  const [departmentListPage, setDepartmentListPage] = useState(1)
+  const [roomListSearch, setRoomListSearch] = useState('')
+  const [roomListDepartmentFilter, setRoomListDepartmentFilter] = useState<number | 'all'>('all')
+  const [roomListStatusFilter, setRoomListStatusFilter] = useState<RoomStatus | 'all'>('all')
+  const [roomListPage, setRoomListPage] = useState(1)
+  const [printerSearchTerm, setPrinterSearchTerm] = useState('')
+  const [printerDepartmentFilter, setPrinterDepartmentFilter] = useState<number | 'all'>('all')
+  const [printerStatusFilter, setPrinterStatusFilter] = useState<PrinterStatus | 'all'>('all')
+  const [printerPage, setPrinterPage] = useState(1)
   const [detailOpen, setDetailOpen] = useState(false)
   const [detailAction, setDetailAction] = useState<DetailAction>(null)
   const [deleteTarget, setDeleteTarget] = useState<DeleteTarget | null>(null)
+  const [writeOffRequest, setWriteOffRequest] = useState<WriteOffRequest | null>(null)
 
   const [selectedCartridgeId, setSelectedCartridgeId] = useState<number | ''>('')
   const [quantity, setQuantity] = useState<number>(0)
@@ -312,6 +521,7 @@ export default function App() {
 
   const [departmentName, setDepartmentName] = useState('')
   const [departmentDescription, setDepartmentDescription] = useState('')
+  const [departmentStatus, setDepartmentStatus] = useState<DepartmentStatus>('ACTIVE')
   const [editingDepartmentId, setEditingDepartmentId] = useState<number | null>(null)
   const [roomName, setRoomName] = useState('')
   const [roomDepartmentId, setRoomDepartmentId] = useState<number | ''>('')
@@ -319,9 +529,17 @@ export default function App() {
   const [roomComment, setRoomComment] = useState('')
   const [editingRoomId, setEditingRoomId] = useState<number | null>(null)
   const [printerName, setPrinterName] = useState('')
+  const [printerModel, setPrinterModel] = useState('')
+  const [printerIpAddress, setPrinterIpAddress] = useState('')
+  const [printerSerialNumber, setPrinterSerialNumber] = useState('')
   const [printerDepartmentId, setPrinterDepartmentId] = useState<number | ''>('')
   const [printerRoomId, setPrinterRoomId] = useState<number | ''>('')
-  const [printerType, setPrinterType] = useState<PrinterType>('MONOCHROME')
+  const [printerDeviceType, setPrinterDeviceType] = useState<PrinterDeviceType>('PRINTER')
+  const [printerColorMode, setPrinterColorMode] = useState<PrinterColorMode>('MONOCHROME')
+  const [printerStatus, setPrinterStatus] = useState<PrinterStatus>('IN_OPERATION')
+  const [printerCommissionedAt, setPrinterCommissionedAt] = useState('')
+  const [printerWrittenOffAt, setPrinterWrittenOffAt] = useState('')
+  const [printerComment, setPrinterComment] = useState('')
   const [printerSlots, setPrinterSlots] = useState<PrinterSlotForm[]>([{ name: 'Основной', cartridgeModelId: '' }])
   const [editingPrinterId, setEditingPrinterId] = useState<number | null>(null)
   const [thresholdModelId, setThresholdModelId] = useState<number | ''>('')
@@ -336,14 +554,49 @@ export default function App() {
   const [historyDateTo, setHistoryDateTo] = useState(today())
   const [historyActor, setHistoryActor] = useState('')
   const [historyActionType, setHistoryActionType] = useState('')
+  const [historyEntityType, setHistoryEntityType] = useState('')
+  const [historyResult, setHistoryResult] = useState('')
   const [historyTargetName, setHistoryTargetName] = useState('')
+  const [historySearchTerm, setHistorySearchTerm] = useState('')
+  const [historyPage, setHistoryPage] = useState(1)
+  const [notificationAlertSearch, setNotificationAlertSearch] = useState('')
+  const [notificationAlertDepartmentFilter, setNotificationAlertDepartmentFilter] = useState<number | 'all'>('all')
+  const [notificationAlertSourceFilter, setNotificationAlertSourceFilter] = useState<string>('all')
+  const [notificationAlertPage, setNotificationAlertPage] = useState(1)
+  const [thresholdSearchTerm, setThresholdSearchTerm] = useState('')
+  const [thresholdDepartmentFilter, setThresholdDepartmentFilter] = useState<number | 'all'>('all')
+  const [thresholdActiveFilter, setThresholdActiveFilter] = useState<'all' | 'active' | 'inactive'>('all')
+  const [thresholdPage, setThresholdPage] = useState(1)
+  const [reportConsumptionSearchTerm, setReportConsumptionSearchTerm] = useState('')
+  const [reportConsumptionPage, setReportConsumptionPage] = useState(1)
+  const [reportSummaryView, setReportSummaryView] = useState<ReportSummaryView>('department')
+  const [reportSummarySearchTerm, setReportSummarySearchTerm] = useState('')
+  const [reportSummaryPage, setReportSummaryPage] = useState(1)
+  const [reportItemsView, setReportItemsView] = useState<ReportItemsView>('stock')
+  const [reportItemsSearchTerm, setReportItemsSearchTerm] = useState('')
+  const [reportItemsPage, setReportItemsPage] = useState(1)
+  const [userSearchTerm, setUserSearchTerm] = useState('')
+  const [userRoleFilter, setUserRoleFilter] = useState<UserRole | 'all'>('all')
+  const [userActiveFilter, setUserActiveFilter] = useState<'all' | 'active' | 'inactive'>('all')
+  const [userPage, setUserPage] = useState(1)
+  const [modelCatalogSearchTerm, setModelCatalogSearchTerm] = useState('')
+  const [modelCatalogTypeFilter, setModelCatalogTypeFilter] = useState<ModelCatalogTypeFilter>('all')
+  const [modelCatalogBalanceFilter, setModelCatalogBalanceFilter] = useState<ModelCatalogBalanceFilter>('all')
+  const [modelCatalogPage, setModelCatalogPage] = useState(1)
   const [assetFilterDepartmentId, setAssetFilterDepartmentId] = useState<number | ''>('')
   const [assetFilterRoomId, setAssetFilterRoomId] = useState<number | ''>('')
   const [assetFilterStatus, setAssetFilterStatus] = useState<InventoryAssetStatus | ''>('')
   const [assetMovementFilterAssetId, setAssetMovementFilterAssetId] = useState<number | ''>('')
+  const [assetSearchTerm, setAssetSearchTerm] = useState('')
+  const [assetPage, setAssetPage] = useState(1)
+  const [movementSearchTerm, setMovementSearchTerm] = useState('')
+  const [movementPage, setMovementPage] = useState(1)
   const [hallFilterRoomId, setHallFilterRoomId] = useState<number | ''>('')
   const [hallFilterStatus, setHallFilterStatus] = useState<HallRequestStatus | ''>('')
   const [hallOverdueOnly, setHallOverdueOnly] = useState(false)
+  const [hallSearchTerm, setHallSearchTerm] = useState('')
+  const [hallPriorityFilter, setHallPriorityFilter] = useState<HallRequestPriority | ''>('')
+  const [hallPage, setHallPage] = useState(1)
   const [assetInventoryCode, setAssetInventoryCode] = useState('')
   const [assetName, setAssetName] = useState('')
   const [assetCategory, setAssetCategory] = useState('')
@@ -370,9 +623,12 @@ export default function App() {
   const [modelName, setModelName] = useState('')
   const [modelRefillable, setModelRefillable] = useState(true)
   const [modelMinimumQuantity, setModelMinimumQuantity] = useState(0)
+  const [modelCompatiblePrintersText, setModelCompatiblePrintersText] = useState('')
+  const [modelCompatibilityDrafts, setModelCompatibilityDrafts] = useState<Record<number, string>>({})
   const [selectedBatchModelIds, setSelectedBatchModelIds] = useState<number[]>([])
   const [batchEntries, setBatchEntries] = useState<Record<number, BatchEntry>>({})
   const [activeBatchIndex, setActiveBatchIndex] = useState(0)
+  const [batchTargetStatus, setBatchTargetStatus] = useState<CartridgeStatus>('IN_STOCK')
   const [installPrinterId, setInstallPrinterId] = useState<number | ''>('')
   const [preferredPrinterId, setPreferredPrinterId] = useState<number | ''>('')
   const [replaceOutcome, setReplaceOutcome] = useState<RemovalOutcome>('STOCK')
@@ -390,12 +646,21 @@ export default function App() {
   const [sessionUser, setSessionUser] = useState('')
   const [sessionExpiresAt, setSessionExpiresAt] = useState<number | null>(null)
   const [authUser, setAuthUser] = useState<AuthUser | null>(null)
+  const sessionRefreshPromiseRef = useRef<Promise<void> | null>(null)
+  const lastActivityAtRef = useRef(Date.now())
+  const lastPersistedActivityAtRef = useRef(0)
+  const canOperate = authUser?.permissions.canOperate === true
+  const canViewLogs = authUser?.permissions.canViewLogs === true
+  const canExportReports = authUser?.permissions.canExportReports === true
+  const canManageUsers = authUser?.permissions.canManageUsers === true
+  const canManageThresholds = authUser?.permissions.canManageThresholds === true
   const [editingUserId, setEditingUserId] = useState<number | null>(null)
   const [userLogin, setUserLogin] = useState('')
   const [userFullName, setUserFullName] = useState('')
   const [userPassword, setUserPassword] = useState('')
   const [userRole, setUserRole] = useState<UserRole>('OPERATOR')
   const [userActive, setUserActive] = useState(true)
+  const [userPermissions, setUserPermissions] = useState<UserPermissions>({ ...DEFAULT_PERMISSIONS_BY_ROLE.OPERATOR })
 
   const clearStoredSession = useCallback(() => {
     localStorage.removeItem(AUTH_STORAGE_KEY)
@@ -407,7 +672,10 @@ export default function App() {
   }, [])
 
   const persistSession = useCallback((token: string, user: AuthUser, expiresAt: number) => {
-    localStorage.setItem(AUTH_STORAGE_KEY, JSON.stringify({ token, user, expiresAt }))
+    const now = Date.now()
+    lastActivityAtRef.current = now
+    lastPersistedActivityAtRef.current = now
+    localStorage.setItem(AUTH_STORAGE_KEY, JSON.stringify({ token, user, expiresAt, lastActivityAt: now }))
     setAuthToken(token)
     setIsAuthed(true)
     setSessionUser(user.fullName)
@@ -422,6 +690,13 @@ export default function App() {
       setToasts((current) => current.filter((toast) => toast.id !== id))
     }, 4000)
   }, [])
+
+  const handleUnauthorized = useCallback(() => {
+    clearStoredSession()
+    setAuthPassword('')
+    setActiveTab('departments')
+    pushToast('error', 'Авторизация истекла или была отозвана. Войдите снова.')
+  }, [clearStoredSession, pushToast])
 
   const selectedCartridge = useMemo(
     () => cartridges.find((item) => item.id === selectedCartridgeId),
@@ -485,17 +760,50 @@ export default function App() {
   }, [currentPage, sortedCartridges])
 
   const dashboardStats = useMemo(() => {
-    const inStock = cartridges.filter((item) => item.status === 'IN_STOCK').length
-    const onRefill = cartridges.filter((item) => item.status === 'ON_REFILL').length
-    const installed = cartridges.filter((item) => item.status === 'INSTALLED').length
-    const totalUnits = cartridges.reduce((sum, item) => sum + item.quantity, 0)
-    return { inStock, onRefill, installed, totalUnits }
-  }, [cartridges])
+    const stock = stockSnapshotReport
+    const printersInOperation = printers.filter((item) => item.status === 'IN_OPERATION').length
+    const printersInStock = printers.filter((item) => item.status === 'IN_STOCK').length
+    const printersInRepair = printers.filter((item) => item.status === 'IN_REPAIR').length
+    const printersWrittenOff = printers.filter((item) => item.status === 'WRITTEN_OFF').length
+
+    return {
+      totalPrinters: printers.length,
+      printersInOperation,
+      printersInStock,
+      printersInRepair,
+      printersWrittenOff,
+      totalCartridgeUnits:
+        (stock?.totalInStock ?? 0) +
+        (stock?.totalReserve ?? 0) +
+        (stock?.totalOnRefill ?? 0) +
+        (stock?.totalInstalled ?? 0) +
+        (stock?.totalWrittenOff ?? 0),
+      cartridgesInStock: stock?.totalInStock ?? 0,
+      cartridgesReserve: stock?.totalReserve ?? 0,
+      cartridgesOnRefill: stock?.totalOnRefill ?? 0,
+      cartridgesInstalled: stock?.totalInstalled ?? 0,
+      cartridgesWrittenOff: stock?.totalWrittenOff ?? 0,
+      alertCount: notificationAlerts.length,
+    }
+  }, [notificationAlerts.length, printers, stockSnapshotReport])
 
   const userDepartments = useMemo(
     () => departments.filter((department) => department.name !== STOCK_DEPARTMENT_NAME),
     [departments],
   )
+
+  const activeUserDepartments = useMemo(
+    () => userDepartments.filter((department) => department.status === 'ACTIVE'),
+    [userDepartments],
+  )
+
+  const availableDepartmentsForRoomForm = useMemo(() => {
+    const selectedDepartment = userDepartments.find((department) => department.id === roomDepartmentId)
+    if (!selectedDepartment || selectedDepartment.status === 'ACTIVE') {
+      return activeUserDepartments
+    }
+    return [...activeUserDepartments, selectedDepartment]
+  }, [activeUserDepartments, roomDepartmentId, userDepartments])
 
   const activeRooms = useMemo(
     () => rooms.filter((room) => room.status === 'ACTIVE'),
@@ -505,6 +813,26 @@ export default function App() {
   const availableRoomsForPrinter = useMemo(
     () => activeRooms.filter((room) => printerDepartmentId && room.departmentId === printerDepartmentId),
     [activeRooms, printerDepartmentId],
+  )
+
+  const printerCompatibleModels = useMemo(
+    () => models.filter((model) => isCartridgeModelCompatibleWithPrinter(model, printerModel)),
+    [models, printerModel],
+  )
+
+  const printerStrictCompatibleModels = useMemo(
+    () =>
+      models.filter(
+        (model) =>
+          (model.compatiblePrinterModels?.length ?? 0) > 0 &&
+          isCartridgeModelCompatibleWithPrinter(model, printerModel),
+      ),
+    [models, printerModel],
+  )
+
+  const hasExplicitPrinterCompatibility = useMemo(
+    () => models.some((model) => (model.compatiblePrinterModels?.length ?? 0) > 0),
+    [models],
   )
 
   const availableRoomsForAsset = useMemo(
@@ -532,24 +860,93 @@ export default function App() {
       .sort((a, b) => b.totalQuantity - a.totalQuantity)
   }, [cartridges, userDepartments])
 
-  const topHistory = useMemo(() => history.slice(0, 4), [history])
+  const recentActivity = useMemo(() => actionLogs.slice(0, 6), [actionLogs])
+  const overviewAlerts = useMemo(() => notificationAlerts.slice(0, 5), [notificationAlerts])
   const selectedCartridgeRefillable = selectedCartridge?.refillable !== false
   const selectedCartridgeEmpty = selectedCartridge?.empty === true
   const sessionRemainingMinutes = sessionExpiresAt
     ? Math.max(0, Math.ceil((sessionExpiresAt - Date.now()) / 60000))
     : 0
 
-  useEffect(() => {
+  const noteSessionActivity = useCallback(() => {
+    const now = Date.now()
+    lastActivityAtRef.current = now
+
+    if (now - lastPersistedActivityAtRef.current < SESSION_ACTIVITY_THROTTLE_MS) {
+      return
+    }
+
     const rawSession = localStorage.getItem(AUTH_STORAGE_KEY)
     if (!rawSession) return
 
     try {
       const parsed = JSON.parse(rawSession) as { token?: string; user?: AuthUser; expiresAt?: number }
+      if (!parsed.token || !parsed.user || !parsed.expiresAt) return
+
+      localStorage.setItem(
+        AUTH_STORAGE_KEY,
+        JSON.stringify({ ...parsed, lastActivityAt: now }),
+      )
+      lastPersistedActivityAtRef.current = now
+    } catch {
+      localStorage.removeItem(AUTH_STORAGE_KEY)
+    }
+  }, [])
+
+  const refreshSessionIfNeeded = useCallback(async (force = false) => {
+    if (!isAuthed || !sessionExpiresAt) return
+
+    const now = Date.now()
+    const recentlyActive = now - lastActivityAtRef.current <= SESSION_REFRESH_WINDOW_MS
+    const shouldRefresh = force || (recentlyActive && sessionExpiresAt - now <= SESSION_REFRESH_WINDOW_MS)
+    if (!shouldRefresh) return
+
+    if (sessionRefreshPromiseRef.current) {
+      await sessionRefreshPromiseRef.current
+      return
+    }
+
+    const refreshPromise = (async () => {
+      const response = await refreshAuthSession()
+      persistSession(response.token, response.user, response.expiresAt)
+      setActor(response.user.fullName)
+      setDetailActor(response.user.fullName)
+    })()
+
+    sessionRefreshPromiseRef.current = refreshPromise
+    try {
+      await refreshPromise
+    } catch (error) {
+      clearStoredSession()
+      pushToast('error', error instanceof Error ? error.message : 'Сессия завершена. Войдите снова.')
+    } finally {
+      sessionRefreshPromiseRef.current = null
+    }
+  }, [clearStoredSession, isAuthed, persistSession, pushToast, sessionExpiresAt])
+
+  useEffect(() => {
+    setUnauthorizedHandler(handleUnauthorized)
+    return () => setUnauthorizedHandler(null)
+  }, [handleUnauthorized])
+
+  useEffect(() => {
+    const rawSession = localStorage.getItem(AUTH_STORAGE_KEY)
+    if (!rawSession) return
+
+    try {
+      const parsed = JSON.parse(rawSession) as {
+        token?: string
+        user?: AuthUser
+        expiresAt?: number
+        lastActivityAt?: number
+      }
       if (!parsed.token || !parsed.user || !parsed.expiresAt || parsed.expiresAt <= Date.now()) {
         localStorage.removeItem(AUTH_STORAGE_KEY)
         return
       }
 
+      lastActivityAtRef.current = parsed.lastActivityAt ?? Date.now()
+      lastPersistedActivityAtRef.current = parsed.lastActivityAt ?? 0
       setAuthToken(parsed.token)
       setIsAuthed(true)
       setSessionUser(parsed.user.fullName)
@@ -579,7 +976,6 @@ export default function App() {
           departmentName: department.name,
           roomName: printer.roomName ?? '-',
           printerName: printer.name,
-          printerType: printer.printerType,
           slotName: slot.name,
           cartridgeModelId: slot.cartridgeModelId ?? null,
           cartridgeModelName: slot.cartridgeModelName ?? 'Не назначен',
@@ -590,6 +986,32 @@ export default function App() {
       ),
     [userDepartments],
   )
+
+  const filteredDepartmentUsageRows = useMemo(() => {
+    const needle = departmentUsageSearch.trim().toLowerCase()
+    return departmentUsageRows.filter((row) => {
+      if (departmentUsageDepartmentFilter !== 'all' && row.departmentId !== departmentUsageDepartmentFilter) {
+        return false
+      }
+      if (!needle) return true
+      return [
+        row.departmentName,
+        row.roomName,
+        row.printerName,
+        row.slotName,
+        row.cartridgeModelName,
+        row.currentInstallation?.cartridgeModelName ?? '',
+        row.currentInstallation?.inventoryCode ?? '',
+      ].some((value) => value.toLowerCase().includes(needle))
+    })
+  }, [departmentUsageDepartmentFilter, departmentUsageRows, departmentUsageSearch])
+
+  const departmentUsageTotalPages = Math.max(1, Math.ceil(filteredDepartmentUsageRows.length / PAGE_SIZE))
+
+  const paginatedDepartmentUsageRows = useMemo(() => {
+    const from = (departmentUsagePage - 1) * PAGE_SIZE
+    return filteredDepartmentUsageRows.slice(from, from + PAGE_SIZE)
+  }, [departmentUsagePage, filteredDepartmentUsageRows])
 
   const selectedDepartmentSlots = useMemo(() => {
     if (!selectedCartridge) return []
@@ -614,7 +1036,7 @@ export default function App() {
 
   const cartridgeDemandSummary = useMemo(() => {
     const stockByModel = cartridges.reduce<Record<string, number>>((acc, cartridge) => {
-      if (cartridge.status !== 'IN_STOCK') return acc
+      if (cartridge.status !== 'IN_STOCK' && cartridge.status !== 'RESERVE') return acc
       acc[cartridge.cartridgeModelName] = (acc[cartridge.cartridgeModelName] ?? 0) + cartridge.quantity
       return acc
     }, {})
@@ -639,6 +1061,454 @@ export default function App() {
       .sort((a, b) => a.replacementBalance - b.replacementBalance || a.modelName.localeCompare(b.modelName))
   }, [cartridges, departmentUsageRows])
 
+  const filteredDepartmentCards = useMemo(() => {
+    const needle = departmentListSearch.trim().toLowerCase()
+    return departmentStats.filter((department) => {
+      if (departmentListStatusFilter !== 'all' && department.status !== departmentListStatusFilter) {
+        return false
+      }
+      if (!needle) return true
+      return [
+        department.name,
+        department.description ?? '',
+        formatDepartmentStatus(department.status),
+      ].some((value) => value.toLowerCase().includes(needle))
+    })
+  }, [departmentListSearch, departmentListStatusFilter, departmentStats])
+
+  const departmentListTotalPages = Math.max(1, Math.ceil(filteredDepartmentCards.length / PAGE_SIZE))
+
+  const paginatedDepartmentCards = useMemo(() => {
+    const from = (departmentListPage - 1) * PAGE_SIZE
+    return filteredDepartmentCards.slice(from, from + PAGE_SIZE)
+  }, [departmentListPage, filteredDepartmentCards])
+
+  const filteredRoomCards = useMemo(() => {
+    const needle = roomListSearch.trim().toLowerCase()
+    return rooms.filter((room) => {
+      if (roomListDepartmentFilter !== 'all' && room.departmentId !== roomListDepartmentFilter) {
+        return false
+      }
+      if (roomListStatusFilter !== 'all' && room.status !== roomListStatusFilter) {
+        return false
+      }
+      if (!needle) return true
+      return [
+        room.name,
+        room.departmentName,
+        room.comment ?? '',
+        formatRoomStatus(room.status),
+      ].some((value) => value.toLowerCase().includes(needle))
+    })
+  }, [roomListDepartmentFilter, roomListSearch, roomListStatusFilter, rooms])
+
+  const roomListTotalPages = Math.max(1, Math.ceil(filteredRoomCards.length / PAGE_SIZE))
+
+  const paginatedRoomCards = useMemo(() => {
+    const from = (roomListPage - 1) * PAGE_SIZE
+    return filteredRoomCards.slice(from, from + PAGE_SIZE)
+  }, [roomListPage, filteredRoomCards])
+
+  const filteredPrinters = useMemo(() => {
+    const needle = printerSearchTerm.trim().toLowerCase()
+    return printers.filter((printer) => {
+      if (printerDepartmentFilter !== 'all' && printer.departmentId !== printerDepartmentFilter) {
+        return false
+      }
+      if (printerStatusFilter !== 'all' && printer.status !== printerStatusFilter) {
+        return false
+      }
+      if (!needle) return true
+      const slotSummary = printer.slots.map((slot) => `${slot.name} ${slot.cartridgeModelName ?? ''}`).join(' ')
+      return [
+        printer.name,
+        printer.model ?? '',
+        printer.ipAddress ?? '',
+        printer.serialNumber ?? '',
+        printer.departmentName ?? '',
+        printer.roomName ?? '',
+        printer.comment ?? '',
+        formatPrinterDeviceType(printer.deviceType),
+        formatPrinterColorMode(printer.colorMode),
+        formatPrinterStatus(printer.status),
+        slotSummary,
+      ].some((value) => value.toLowerCase().includes(needle))
+    })
+  }, [printerDepartmentFilter, printerSearchTerm, printerStatusFilter, printers])
+
+  const printerTotalPages = Math.max(1, Math.ceil(filteredPrinters.length / PAGE_SIZE))
+
+  const paginatedPrinters = useMemo(() => {
+    const from = (printerPage - 1) * PAGE_SIZE
+    return filteredPrinters.slice(from, from + PAGE_SIZE)
+  }, [filteredPrinters, printerPage])
+
+  const filteredActionLogs = useMemo(() => {
+    const needle = historySearchTerm.trim().toLowerCase()
+    if (!needle) return actionLogs
+    return actionLogs.filter((entry) =>
+      [
+        entry.targetName ?? '',
+        entry.details ?? '',
+        entry.actor ?? '',
+        entry.deviceInfo ?? '',
+        entry.oldValues ?? '',
+        entry.newValues ?? '',
+        formatActionEntityType(entry.entityType),
+        formatActionType(entry.actionType),
+        formatActionResult(entry.result),
+      ].some((value) => value.toLowerCase().includes(needle)),
+    )
+  }, [actionLogs, historySearchTerm])
+
+  const historyTotalPages = Math.max(1, Math.ceil(filteredActionLogs.length / PAGE_SIZE))
+
+  const paginatedActionLogs = useMemo(() => {
+    const from = (historyPage - 1) * PAGE_SIZE
+    return filteredActionLogs.slice(from, from + PAGE_SIZE)
+  }, [filteredActionLogs, historyPage])
+
+  const filteredNotificationAlerts = useMemo(() => {
+    const needle = notificationAlertSearch.trim().toLowerCase()
+    return notificationAlerts.filter((alert) => {
+      if (notificationAlertDepartmentFilter !== 'all' && alert.departmentId !== notificationAlertDepartmentFilter) {
+        return false
+      }
+      if (notificationAlertSourceFilter !== 'all' && alert.source !== notificationAlertSourceFilter) {
+        return false
+      }
+      if (!needle) return true
+      return [
+        alert.departmentName,
+        alert.cartridgeModelName,
+        alert.source,
+      ].some((value) => value.toLowerCase().includes(needle))
+    })
+  }, [notificationAlertDepartmentFilter, notificationAlertSearch, notificationAlertSourceFilter, notificationAlerts])
+
+  const notificationAlertTotalPages = Math.max(1, Math.ceil(filteredNotificationAlerts.length / PAGE_SIZE))
+
+  const paginatedNotificationAlerts = useMemo(() => {
+    const from = (notificationAlertPage - 1) * PAGE_SIZE
+    return filteredNotificationAlerts.slice(from, from + PAGE_SIZE)
+  }, [filteredNotificationAlerts, notificationAlertPage])
+
+  const filteredThresholds = useMemo(() => {
+    const needle = thresholdSearchTerm.trim().toLowerCase()
+    return notificationThresholds.filter((item) => {
+      if (thresholdDepartmentFilter !== 'all' && item.departmentId !== thresholdDepartmentFilter) {
+        return false
+      }
+      if (thresholdActiveFilter === 'active' && !item.active) {
+        return false
+      }
+      if (thresholdActiveFilter === 'inactive' && item.active) {
+        return false
+      }
+      if (!needle) return true
+      return [
+        item.cartridgeModelName,
+        item.departmentName ?? 'Все отделы',
+        item.comment ?? '',
+      ].some((value) => value.toLowerCase().includes(needle))
+    })
+  }, [notificationThresholds, thresholdActiveFilter, thresholdDepartmentFilter, thresholdSearchTerm])
+
+  const thresholdTotalPages = Math.max(1, Math.ceil(filteredThresholds.length / PAGE_SIZE))
+
+  const paginatedThresholds = useMemo(() => {
+    const from = (thresholdPage - 1) * PAGE_SIZE
+    return filteredThresholds.slice(from, from + PAGE_SIZE)
+  }, [filteredThresholds, thresholdPage])
+
+  const filteredConsumptionRows = useMemo(() => {
+    const rows = consumptionReport?.rows ?? []
+    const needle = reportConsumptionSearchTerm.trim().toLowerCase()
+    if (!needle) return rows
+    return rows.filter((row) => row.modelName.toLowerCase().includes(needle))
+  }, [consumptionReport, reportConsumptionSearchTerm])
+
+  const reportConsumptionTotalPages = Math.max(1, Math.ceil(filteredConsumptionRows.length / PAGE_SIZE))
+
+  const paginatedConsumptionRows = useMemo(
+    () => paginateItems(filteredConsumptionRows, reportConsumptionPage),
+    [filteredConsumptionRows, reportConsumptionPage],
+  )
+
+  const reportSummaryDataset = useMemo(() => {
+    if (!stockSnapshotReport) {
+      return {
+        title: '',
+        headers: [] as string[],
+        rows: [] as Array<{ key: string; cells: Array<string | number>; searchText: string }>,
+      }
+    }
+
+    if (reportSummaryView === 'department') {
+      return {
+        title: 'Остатки по отделам',
+        headers: ['Отдел', 'На складе', 'В резерве', 'На заправке', 'Установлено', 'Списано', 'Всего'],
+        rows: stockSnapshotReport.byDepartment.map((row) => ({
+          key: String(row.departmentId),
+          cells: [
+            row.departmentName,
+            row.inStockQuantity,
+            row.reserveQuantity,
+            row.onRefillQuantity,
+            row.installedQuantity,
+            row.writtenOffQuantity,
+            row.totalQuantity,
+          ],
+          searchText: row.departmentName,
+        })),
+      }
+    }
+
+    if (reportSummaryView === 'model') {
+      return {
+        title: 'Остатки по моделям картриджей',
+        headers: ['Модель картриджа', 'На складе', 'В резерве', 'На заправке', 'Установлено', 'Списано', 'Всего'],
+        rows: stockSnapshotReport.byModel.map((row) => ({
+          key: String(row.cartridgeModelId),
+          cells: [
+            row.cartridgeModelName,
+            row.inStockQuantity,
+            row.reserveQuantity,
+            row.onRefillQuantity,
+            row.installedQuantity,
+            row.writtenOffQuantity,
+            row.totalQuantity,
+          ],
+          searchText: row.cartridgeModelName,
+        })),
+      }
+    }
+
+    if (reportSummaryView === 'room') {
+      return {
+        title: 'Остатки по кабинетам',
+        headers: ['Кабинет', 'На складе', 'В резерве', 'На заправке', 'Установлено', 'Списано', 'Всего'],
+        rows: stockSnapshotReport.byRoom.map((row) => ({
+          key: `${row.roomId ?? 'none'}-${row.roomName}`,
+          cells: [
+            row.roomName,
+            row.inStockQuantity,
+            row.reserveQuantity,
+            row.onRefillQuantity,
+            row.installedQuantity,
+            row.writtenOffQuantity,
+            row.totalQuantity,
+          ],
+          searchText: row.roomName,
+        })),
+      }
+    }
+
+    if (reportSummaryView === 'type') {
+      return {
+        title: 'Остатки по типам картриджей',
+        headers: ['Тип картриджа', 'На складе', 'В резерве', 'На заправке', 'Установлено', 'Списано', 'Всего'],
+        rows: stockSnapshotReport.byType.map((row) => ({
+          key: row.cartridgeType,
+          cells: [
+            row.cartridgeType,
+            row.inStockQuantity,
+            row.reserveQuantity,
+            row.onRefillQuantity,
+            row.installedQuantity,
+            row.writtenOffQuantity,
+            row.totalQuantity,
+          ],
+          searchText: row.cartridgeType,
+        })),
+      }
+    }
+
+    return {
+      title: 'Принтеры по моделям',
+      headers: ['Модель принтера', 'В эксплуатации', 'На складе', 'В ремонте', 'Списано', 'Всего'],
+      rows: stockSnapshotReport.byPrinterModel.map((row) => ({
+        key: row.printerModelName,
+        cells: [
+          row.printerModelName,
+          row.inOperationCount,
+          row.inStockCount,
+          row.inRepairCount,
+          row.writtenOffCount,
+          row.totalCount,
+        ],
+        searchText: row.printerModelName,
+      })),
+    }
+  }, [reportSummaryView, stockSnapshotReport])
+
+  const filteredReportSummaryRows = useMemo(() => {
+    const needle = reportSummarySearchTerm.trim().toLowerCase()
+    if (!needle) return reportSummaryDataset.rows
+    return reportSummaryDataset.rows.filter((row) => row.searchText.toLowerCase().includes(needle))
+  }, [reportSummaryDataset.rows, reportSummarySearchTerm])
+
+  const reportSummaryTotalPages = Math.max(1, Math.ceil(filteredReportSummaryRows.length / PAGE_SIZE))
+
+  const paginatedReportSummaryRows = useMemo(
+    () => paginateItems(filteredReportSummaryRows, reportSummaryPage),
+    [filteredReportSummaryRows, reportSummaryPage],
+  )
+
+  const reportItemsDataset = useMemo(() => {
+    if (!stockSnapshotReport) {
+      return {
+        title: '',
+        rows: [] as Array<{ key: string; cells: Array<string | number>; searchText: string }>,
+      }
+    }
+
+    const config = reportItemsView === 'stock'
+      ? { title: 'Позиции на складе', rows: stockSnapshotReport.inStockItems }
+      : reportItemsView === 'reserve'
+        ? { title: 'Позиции в резерве', rows: stockSnapshotReport.reserveItems }
+        : reportItemsView === 'refill'
+          ? { title: 'Позиции на заправке', rows: stockSnapshotReport.onRefillItems }
+          : { title: 'Списанные позиции', rows: stockSnapshotReport.writtenOffItems }
+
+    return {
+      title: config.title,
+      rows: config.rows.map((row) => ({
+        key: `${reportItemsView}-${row.cartridgeId}`,
+        cells: [
+          row.inventoryCode,
+          row.cartridgeModelName,
+          row.departmentName,
+          row.roomName ?? '-',
+          row.quantity,
+          row.cartridgeType,
+        ],
+        searchText: [
+          row.inventoryCode,
+          row.cartridgeModelName,
+          row.departmentName,
+          row.roomName ?? '',
+          row.cartridgeType,
+        ].join(' '),
+      })),
+    }
+  }, [reportItemsView, stockSnapshotReport])
+
+  const filteredReportItemRows = useMemo(() => {
+    const needle = reportItemsSearchTerm.trim().toLowerCase()
+    if (!needle) return reportItemsDataset.rows
+    return reportItemsDataset.rows.filter((row) => row.searchText.toLowerCase().includes(needle))
+  }, [reportItemsDataset.rows, reportItemsSearchTerm])
+
+  const reportItemsTotalPages = Math.max(1, Math.ceil(filteredReportItemRows.length / PAGE_SIZE))
+
+  const paginatedReportItemRows = useMemo(
+    () => paginateItems(filteredReportItemRows, reportItemsPage),
+    [filteredReportItemRows, reportItemsPage],
+  )
+
+  const filteredUsers = useMemo(() => {
+    const needle = userSearchTerm.trim().toLowerCase()
+    return users.filter((user) => {
+      if (userRoleFilter !== 'all' && user.role !== userRoleFilter) {
+        return false
+      }
+      if (userActiveFilter === 'active' && !user.active) {
+        return false
+      }
+      if (userActiveFilter === 'inactive' && user.active) {
+        return false
+      }
+      if (!needle) return true
+      return [
+        user.username,
+        user.fullName,
+        user.role,
+        user.active ? 'Активен' : 'Отключен',
+      ].some((value) => value.toLowerCase().includes(needle))
+    })
+  }, [userActiveFilter, userRoleFilter, userSearchTerm, users])
+
+  const userTotalPages = Math.max(1, Math.ceil(filteredUsers.length / PAGE_SIZE))
+
+  const paginatedUsers = useMemo(() => {
+    const from = (userPage - 1) * PAGE_SIZE
+    return filteredUsers.slice(from, from + PAGE_SIZE)
+  }, [filteredUsers, userPage])
+
+  const filteredInventoryAssets = useMemo(() => {
+    const needle = assetSearchTerm.trim().toLowerCase()
+    if (!needle) return inventoryAssets
+    return inventoryAssets.filter((asset) =>
+      [
+        asset.inventoryCode,
+        asset.name,
+        asset.category ?? '',
+        asset.departmentName ?? '',
+        asset.roomName ?? '',
+        asset.comment ?? '',
+        INVENTORY_STATUS_OPTIONS.find((item) => item.value === asset.status)?.label ?? asset.status,
+      ].some((value) => value.toLowerCase().includes(needle)),
+    )
+  }, [assetSearchTerm, inventoryAssets])
+
+  const assetTotalPages = Math.max(1, Math.ceil(filteredInventoryAssets.length / PAGE_SIZE))
+
+  const paginatedInventoryAssets = useMemo(() => {
+    const from = (assetPage - 1) * PAGE_SIZE
+    return filteredInventoryAssets.slice(from, from + PAGE_SIZE)
+  }, [assetPage, filteredInventoryAssets])
+
+  const filteredInventoryMovements = useMemo(() => {
+    const needle = movementSearchTerm.trim().toLowerCase()
+    if (!needle) return inventoryMovements
+    return inventoryMovements.filter((movement) =>
+      [
+        movement.assetInventoryCode,
+        movement.assetName,
+        movement.fromDepartmentName ?? '',
+        movement.fromRoomName ?? '',
+        movement.toDepartmentName ?? '',
+        movement.toRoomName ?? '',
+        movement.actor ?? '',
+        movement.comment ?? '',
+      ].some((value) => value.toLowerCase().includes(needle)),
+    )
+  }, [inventoryMovements, movementSearchTerm])
+
+  const movementTotalPages = Math.max(1, Math.ceil(filteredInventoryMovements.length / PAGE_SIZE))
+
+  const paginatedInventoryMovements = useMemo(() => {
+    const from = (movementPage - 1) * PAGE_SIZE
+    return filteredInventoryMovements.slice(from, from + PAGE_SIZE)
+  }, [filteredInventoryMovements, movementPage])
+
+  const filteredHallRequests = useMemo(() => {
+    const needle = hallSearchTerm.trim().toLowerCase()
+    return hallRequests.filter((request) => {
+      if (hallPriorityFilter && request.priority !== hallPriorityFilter) {
+        return false
+      }
+      if (!needle) return true
+      return [
+        request.roomName,
+        request.departmentName,
+        request.requesterName,
+        request.title,
+        request.description ?? '',
+        HALL_REQUEST_PRIORITY_OPTIONS.find((item) => item.value === request.priority)?.label ?? request.priority,
+        HALL_REQUEST_STATUS_OPTIONS.find((item) => item.value === request.status)?.label ?? request.status,
+      ].some((value) => value.toLowerCase().includes(needle))
+    })
+  }, [hallPriorityFilter, hallRequests, hallSearchTerm])
+
+  const hallTotalPages = Math.max(1, Math.ceil(filteredHallRequests.length / PAGE_SIZE))
+
+  const paginatedHallRequests = useMemo(() => {
+    const from = (hallPage - 1) * PAGE_SIZE
+    return filteredHallRequests.slice(from, from + PAGE_SIZE)
+  }, [filteredHallRequests, hallPage])
+
   const selectedBatchModels = useMemo(
     () => selectedBatchModelIds.map((id) => models.find((item) => item.id === id)).filter(Boolean) as CartridgeModel[],
     [models, selectedBatchModelIds],
@@ -658,10 +1528,13 @@ export default function App() {
       .map((model) => {
         const related = cartridges.filter((item) => item.cartridgeModelId === model.id)
         const ready = related
-          .filter((item) => item.status === 'IN_STOCK' && item.empty !== true)
+          .filter((item) => (item.status === 'IN_STOCK' || item.status === 'RESERVE') && item.empty !== true)
           .reduce((sum, item) => sum + item.quantity, 0)
         const empty = related
-          .filter((item) => item.status === 'IN_STOCK' && item.empty === true)
+          .filter((item) => (item.status === 'IN_STOCK' || item.status === 'RESERVE') && item.empty === true)
+          .reduce((sum, item) => sum + item.quantity, 0)
+        const reserve = related
+          .filter((item) => item.status === 'RESERVE')
           .reduce((sum, item) => sum + item.quantity, 0)
         const onRefill = related
           .filter((item) => item.status === 'ON_REFILL')
@@ -672,6 +1545,7 @@ export default function App() {
           ...model,
           ready,
           empty,
+          reserve,
           onRefill,
           assignedPoints: usageByModelId[model.id] ?? 0,
           balance,
@@ -693,6 +1567,44 @@ export default function App() {
   const modelSummaryById = useMemo(
     () => Object.fromEntries(modelStockSummary.map((item) => [item.id, item])),
     [modelStockSummary],
+  )
+
+  const filteredModelCatalogItems = useMemo(() => {
+    const needle = modelCatalogSearchTerm.trim().toLowerCase()
+    return models.filter((item) => {
+      if (modelCatalogTypeFilter === 'refillable' && !item.refillable) {
+        return false
+      }
+      if (modelCatalogTypeFilter === 'disposable' && item.refillable) {
+        return false
+      }
+
+      const balance = modelSummaryById[item.id]?.balance ?? 0
+      if (modelCatalogBalanceFilter === 'deficit' && balance >= 0) {
+        return false
+      }
+      if (modelCatalogBalanceFilter === 'minimum' && balance !== 0) {
+        return false
+      }
+      if (modelCatalogBalanceFilter === 'surplus' && balance <= 0) {
+        return false
+      }
+
+      if (!needle) return true
+
+      return [
+        item.name,
+        item.refillable ? 'Заправляемый' : 'Одноразовый',
+        item.compatiblePrinterModels.join(' '),
+      ].some((value) => value.toLowerCase().includes(needle))
+    })
+  }, [modelCatalogBalanceFilter, modelCatalogSearchTerm, modelCatalogTypeFilter, modelSummaryById, models])
+
+  const modelCatalogTotalPages = Math.max(1, Math.ceil(filteredModelCatalogItems.length / PAGE_SIZE))
+
+  const paginatedModelCatalogItems = useMemo(
+    () => paginateItems(filteredModelCatalogItems, modelCatalogPage),
+    [filteredModelCatalogItems, modelCatalogPage],
   )
 
   const disposableWrittenOffByModel = useMemo(() => {
@@ -731,10 +1643,12 @@ export default function App() {
       dateTo: normalizedTo || undefined,
       actor: historyActor || undefined,
       actionType: historyActionType || undefined,
+      entityType: historyEntityType || undefined,
+      result: historyResult || undefined,
       targetName: historyTargetName || undefined,
     })
     setActionLogs(logs)
-  }, [historyActionType, historyActor, historyDateFrom, historyDateTo, historyTargetName])
+  }, [historyActionType, historyActor, historyDateFrom, historyDateTo, historyEntityType, historyResult, historyTargetName])
 
   const loadInventoryAssets = useCallback(async () => {
     const rows = await getInventoryAssets({
@@ -762,7 +1676,7 @@ export default function App() {
   const refreshCatalog = useCallback(async () => {
     setLoading(true)
     try {
-      const [deps, loadedRooms, loadedPrinters, loadedModels, cart, moduleCatalog, alerts, thresholds] = await Promise.all([
+      const [deps, loadedRooms, loadedPrinters, loadedModels, cart, moduleCatalog, alerts, thresholds, snapshot] = await Promise.all([
         getDepartments(),
         getRooms(),
         getPrinters(),
@@ -770,7 +1684,8 @@ export default function App() {
         getCartridges(),
         getSystemModules(),
         getNotificationAlerts(),
-        getNotificationThresholds(),
+        canManageThresholds ? getNotificationThresholds() : Promise.resolve([]),
+        getStockSnapshotReport(),
       ])
       setDepartments(deps)
       setRooms(loadedRooms)
@@ -780,9 +1695,14 @@ export default function App() {
       setSystemModules(moduleCatalog)
       setNotificationAlerts(alerts)
       setNotificationThresholds(thresholds)
-      await loadActionLogs()
+      setStockSnapshotReport(snapshot)
+      if (canViewLogs) {
+        await loadActionLogs()
+      } else {
+        setActionLogs([])
+      }
       await Promise.all([loadInventoryAssets(), loadInventoryMovements(), loadHallRequests()])
-      if (authUser?.permissions.canManageUsers) {
+      if (canManageUsers) {
         setUsers(await getUsers())
       } else {
         setUsers([])
@@ -792,27 +1712,11 @@ export default function App() {
     } finally {
       setLoading(false)
     }
-  }, [authUser?.permissions.canManageUsers, loadActionLogs, loadHallRequests, loadInventoryAssets, loadInventoryMovements, pushToast])
-
-  const refreshHistory = useCallback(
-    async (cartridgeId: number) => {
-      try {
-        const records = await getRefillHistory(cartridgeId)
-        setHistory(records)
-      } catch (e) {
-        pushToast('error', e instanceof Error ? e.message : 'Не удалось загрузить историю.')
-      }
-    },
-    [pushToast],
-  )
+  }, [canManageThresholds, canManageUsers, canViewLogs, loadActionLogs, loadHallRequests, loadInventoryAssets, loadInventoryMovements, pushToast])
 
   useEffect(() => {
     if (isAuthed) void refreshCatalog()
   }, [isAuthed, refreshCatalog])
-
-  useEffect(() => {
-    if (selectedCartridgeId) void refreshHistory(selectedCartridgeId)
-  }, [selectedCartridgeId, refreshHistory])
 
   useEffect(() => {
     if (!selectedCartridge) return
@@ -855,13 +1759,23 @@ export default function App() {
   }, [isAuthed, loadHallRequests])
 
   useEffect(() => {
-    if (authUser?.permissions.canManageUsers) return
+    if (canManageUsers) return
     setUsers([])
     resetUserForm()
     if (activeTab === 'users') {
       setActiveTab('overview')
     }
-  }, [activeTab, authUser?.permissions.canManageUsers])
+  }, [activeTab, canManageUsers])
+
+  useEffect(() => {
+    if (activeTab === 'history' && !canViewLogs) {
+      setActiveTab('overview')
+    } else if (activeTab === 'reports' && !canExportReports) {
+      setActiveTab('overview')
+    } else if (activeTab === 'create' && !canOperate) {
+      setActiveTab('overview')
+    }
+  }, [activeTab, canExportReports, canOperate, canViewLogs])
 
   useEffect(() => {
     setCurrentPage(1)
@@ -870,6 +1784,126 @@ export default function App() {
   useEffect(() => {
     if (currentPage > totalPages) setCurrentPage(totalPages)
   }, [currentPage, totalPages])
+
+  useEffect(() => {
+    setDepartmentUsagePage(1)
+  }, [departmentUsageDepartmentFilter, departmentUsageSearch])
+
+  useEffect(() => {
+    if (departmentUsagePage > departmentUsageTotalPages) setDepartmentUsagePage(departmentUsageTotalPages)
+  }, [departmentUsagePage, departmentUsageTotalPages])
+
+  useEffect(() => {
+    setDepartmentListPage(1)
+  }, [departmentListSearch, departmentListStatusFilter])
+
+  useEffect(() => {
+    if (departmentListPage > departmentListTotalPages) setDepartmentListPage(departmentListTotalPages)
+  }, [departmentListPage, departmentListTotalPages])
+
+  useEffect(() => {
+    setRoomListPage(1)
+  }, [roomListDepartmentFilter, roomListSearch, roomListStatusFilter])
+
+  useEffect(() => {
+    if (roomListPage > roomListTotalPages) setRoomListPage(roomListTotalPages)
+  }, [roomListPage, roomListTotalPages])
+
+  useEffect(() => {
+    setPrinterPage(1)
+  }, [printerDepartmentFilter, printerSearchTerm, printerStatusFilter])
+
+  useEffect(() => {
+    if (printerPage > printerTotalPages) setPrinterPage(printerTotalPages)
+  }, [printerPage, printerTotalPages])
+
+  useEffect(() => {
+    setHistoryPage(1)
+  }, [historySearchTerm, actionLogs])
+
+  useEffect(() => {
+    if (historyPage > historyTotalPages) setHistoryPage(historyTotalPages)
+  }, [historyPage, historyTotalPages])
+
+  useEffect(() => {
+    setNotificationAlertPage(1)
+  }, [notificationAlertDepartmentFilter, notificationAlertSearch, notificationAlertSourceFilter])
+
+  useEffect(() => {
+    if (notificationAlertPage > notificationAlertTotalPages) setNotificationAlertPage(notificationAlertTotalPages)
+  }, [notificationAlertPage, notificationAlertTotalPages])
+
+  useEffect(() => {
+    setThresholdPage(1)
+  }, [thresholdActiveFilter, thresholdDepartmentFilter, thresholdSearchTerm])
+
+  useEffect(() => {
+    if (thresholdPage > thresholdTotalPages) setThresholdPage(thresholdTotalPages)
+  }, [thresholdPage, thresholdTotalPages])
+
+  useEffect(() => {
+    setReportConsumptionPage(1)
+  }, [reportConsumptionSearchTerm, consumptionReport])
+
+  useEffect(() => {
+    if (reportConsumptionPage > reportConsumptionTotalPages) setReportConsumptionPage(reportConsumptionTotalPages)
+  }, [reportConsumptionPage, reportConsumptionTotalPages])
+
+  useEffect(() => {
+    setReportSummaryPage(1)
+  }, [reportSummarySearchTerm, reportSummaryView, stockSnapshotReport])
+
+  useEffect(() => {
+    if (reportSummaryPage > reportSummaryTotalPages) setReportSummaryPage(reportSummaryTotalPages)
+  }, [reportSummaryPage, reportSummaryTotalPages])
+
+  useEffect(() => {
+    setReportItemsPage(1)
+  }, [reportItemsSearchTerm, reportItemsView, stockSnapshotReport])
+
+  useEffect(() => {
+    if (reportItemsPage > reportItemsTotalPages) setReportItemsPage(reportItemsTotalPages)
+  }, [reportItemsPage, reportItemsTotalPages])
+
+  useEffect(() => {
+    setUserPage(1)
+  }, [userActiveFilter, userRoleFilter, userSearchTerm])
+
+  useEffect(() => {
+    if (userPage > userTotalPages) setUserPage(userTotalPages)
+  }, [userPage, userTotalPages])
+
+  useEffect(() => {
+    setModelCatalogPage(1)
+  }, [modelCatalogBalanceFilter, modelCatalogSearchTerm, modelCatalogTypeFilter, models])
+
+  useEffect(() => {
+    if (modelCatalogPage > modelCatalogTotalPages) setModelCatalogPage(modelCatalogTotalPages)
+  }, [modelCatalogPage, modelCatalogTotalPages])
+
+  useEffect(() => {
+    setAssetPage(1)
+  }, [assetSearchTerm, inventoryAssets])
+
+  useEffect(() => {
+    if (assetPage > assetTotalPages) setAssetPage(assetTotalPages)
+  }, [assetPage, assetTotalPages])
+
+  useEffect(() => {
+    setMovementPage(1)
+  }, [assetMovementFilterAssetId, movementSearchTerm, inventoryMovements])
+
+  useEffect(() => {
+    if (movementPage > movementTotalPages) setMovementPage(movementTotalPages)
+  }, [movementPage, movementTotalPages])
+
+  useEffect(() => {
+    setHallPage(1)
+  }, [hallPriorityFilter, hallSearchTerm, hallRequests])
+
+  useEffect(() => {
+    if (hallPage > hallTotalPages) setHallPage(hallTotalPages)
+  }, [hallPage, hallTotalPages])
 
   useEffect(() => {
     if (!printerRoomId) return
@@ -909,7 +1943,7 @@ export default function App() {
   }, [activeBatchIndex, selectedBatchModels.length])
 
   useEffect(() => {
-    if (!sessionExpiresAt) return
+    if (!isAuthed || !sessionExpiresAt) return
     if (sessionExpiresAt <= Date.now()) {
       clearStoredSession()
       return
@@ -921,7 +1955,47 @@ export default function App() {
     }, Math.max(0, sessionExpiresAt - Date.now()))
 
     return () => window.clearTimeout(timer)
-  }, [clearStoredSession, pushToast, sessionExpiresAt])
+  }, [clearStoredSession, isAuthed, pushToast, sessionExpiresAt])
+
+  useEffect(() => {
+    if (!isAuthed) return
+
+    const handleActivity = () => {
+      noteSessionActivity()
+      void refreshSessionIfNeeded()
+    }
+    const handleVisibilityChange = () => {
+      if (document.hidden) return
+      handleActivity()
+    }
+
+    const events: Array<keyof WindowEventMap> = ['pointerdown', 'keydown', 'scroll', 'focus']
+    events.forEach((eventName) => window.addEventListener(eventName, handleActivity, { passive: true }))
+    document.addEventListener('visibilitychange', handleVisibilityChange)
+
+    return () => {
+      events.forEach((eventName) => window.removeEventListener(eventName, handleActivity))
+      document.removeEventListener('visibilitychange', handleVisibilityChange)
+    }
+  }, [isAuthed, noteSessionActivity, refreshSessionIfNeeded])
+
+  useEffect(() => {
+    if (!isAuthed) return
+
+    const interval = window.setInterval(() => {
+      if (document.hidden) return
+
+      if (sessionExpiresAt && sessionExpiresAt <= Date.now()) {
+        clearStoredSession()
+        pushToast('error', 'Сессия истекла из-за неактивности. Войдите снова.')
+        return
+      }
+
+      void refreshSessionIfNeeded()
+    }, 60 * 1000)
+
+    return () => window.clearInterval(interval)
+  }, [clearStoredSession, isAuthed, pushToast, refreshSessionIfNeeded, sessionExpiresAt])
 
   async function applyFilters() {
     setLoading(true)
@@ -943,7 +2017,6 @@ export default function App() {
       await action()
       pushToast('success', successText)
       await refreshCatalog()
-      if (selectedCartridgeId) await refreshHistory(selectedCartridgeId)
     } catch (e) {
       pushToast('error', e instanceof Error ? e.message : 'Операция завершилась ошибкой.')
     }
@@ -961,6 +2034,7 @@ export default function App() {
     setEditingDepartmentId(department.id)
     setDepartmentName(department.name)
     setDepartmentDescription(department.description || '')
+    setDepartmentStatus(department.status)
     setActiveTab('departments')
   }
 
@@ -968,6 +2042,7 @@ export default function App() {
     setEditingDepartmentId(null)
     setDepartmentName('')
     setDepartmentDescription('')
+    setDepartmentStatus('ACTIVE')
   }
 
   function beginRoomEdit(room: Room) {
@@ -1081,6 +2156,7 @@ export default function App() {
     setUserPassword('')
     setUserRole(user.role)
     setUserActive(user.active)
+    setUserPermissions({ ...user.permissions })
     setActiveTab('users')
   }
 
@@ -1091,6 +2167,19 @@ export default function App() {
     setUserPassword('')
     setUserRole('OPERATOR')
     setUserActive(true)
+    setUserPermissions({ ...DEFAULT_PERMISSIONS_BY_ROLE.OPERATOR })
+  }
+
+  function applyRolePreset(role: UserRole) {
+    setUserRole(role)
+    setUserPermissions({ ...DEFAULT_PERMISSIONS_BY_ROLE[role] })
+  }
+
+  function updateUserPermission(permission: keyof UserPermissions, value: boolean) {
+    setUserPermissions((current) => ({
+      ...current,
+      [permission]: value,
+    }))
   }
 
   function requestDelete(target: DeleteTarget) {
@@ -1107,21 +2196,21 @@ export default function App() {
           await deletePrinter(deleteTarget.id)
           if (editingPrinterId === deleteTarget.id) resetPrinterForm()
           setDeleteTarget(null)
-        }, 'Принтер удален.')
+        }, 'Принтер списан.')
         break
       case 'department':
         void withAction(async () => {
           await deleteDepartment(deleteTarget.id)
           if (editingDepartmentId === deleteTarget.id) resetDepartmentForm()
           setDeleteTarget(null)
-        }, 'Отдел удален.')
+        }, 'Отдел выведен из использования.')
         break
       case 'room':
         void withAction(async () => {
           await deleteRoom(deleteTarget.id)
           if (editingRoomId === deleteTarget.id) resetRoomForm()
           setDeleteTarget(null)
-        }, 'Кабинет удален.')
+        }, 'Кабинет выведен из использования.')
         break
       case 'threshold':
         void withAction(async () => {
@@ -1167,6 +2256,24 @@ export default function App() {
         }, 'Модель картриджа удалена.')
         break
     }
+  }
+
+  function requestWriteOff(source: 'stock' | 'detail', cartridgeId: number, label: string) {
+    if (!confirmAdminPin()) return
+    setWriteOffRequest({ source, cartridgeId, label })
+  }
+
+  function confirmWriteOffRequest() {
+    if (!writeOffRequest) return
+
+    const effectiveComment = writeOffRequest.source === 'detail' ? detailComment : comment
+    void withAction(async () => {
+      await writeOff(writeOffRequest.cartridgeId, effectiveComment)
+      setWriteOffRequest(null)
+      if (writeOffRequest.source === 'detail') {
+        setDetailAction(null)
+      }
+    }, 'Картридж списан.')
   }
 
   async function handleQuickReplace(slotId: number, cartridgeModelId: number, hasInstalled: boolean) {
@@ -1282,10 +2389,7 @@ export default function App() {
     event.preventDefault()
     const id = requireCartridge()
     if (!id) return
-    if (!window.confirm('Подтвердите списание картриджа.')) return
-    void withAction(async () => {
-      await writeOff(id, comment)
-    }, 'Картридж списан.')
+    requestWriteOff('stock', id, selectedCartridge?.cartridgeModelName || `Картридж #${id}`)
   }
 
   function onReplaceCartridge(event: FormEvent) {
@@ -1364,7 +2468,6 @@ export default function App() {
     clearStoredSession()
     setAuthPassword('')
     setSelectedCartridgeId('')
-    setHistory([])
     setUsers([])
     setInventoryAssets([])
     setInventoryMovements([])
@@ -1423,10 +2526,7 @@ export default function App() {
   function onDetailWriteOff(event: FormEvent) {
     event.preventDefault()
     if (!selectedCartridge) return
-    if (!window.confirm('Подтвердите списание картриджа.')) return
-    void withAction(async () => {
-      await writeOff(selectedCartridge.id, detailComment)
-    }, 'Картридж списан.')
+    requestWriteOff('detail', selectedCartridge.id, selectedCartridge.cartridgeModelName)
   }
 
   function onCreateDepartment(event: FormEvent) {
@@ -1439,6 +2539,7 @@ export default function App() {
       const payload = {
         name: departmentName.trim(),
         description: departmentDescription.trim(),
+        status: departmentStatus,
       }
 
       if (editingDepartmentId) {
@@ -1458,6 +2559,25 @@ export default function App() {
     }
     if (!roomDepartmentId) {
       pushToast('error', 'Выберите отдел для кабинета.')
+      return
+    }
+
+    const selectedDepartment = userDepartments.find((department) => department.id === roomDepartmentId)
+    const editingRoom = editingRoomId ? rooms.find((room) => room.id === editingRoomId) : null
+    const keepsCurrentArchivedDepartment = Boolean(
+      editingRoom &&
+      selectedDepartment &&
+      editingRoom.departmentId === selectedDepartment.id &&
+      selectedDepartment.status === 'DECOMMISSIONED',
+    )
+
+    if (!selectedDepartment) {
+      pushToast('error', 'Выбранный отдел не найден.')
+      return
+    }
+
+    if (selectedDepartment.status !== 'ACTIVE' && !keepsCurrentArchivedDepartment) {
+      pushToast('error', 'Нельзя привязать кабинет к отделу, который выведен из использования.')
       return
     }
 
@@ -1505,7 +2625,7 @@ export default function App() {
 
   function onSaveUser(event: FormEvent) {
     event.preventDefault()
-    if (!authUser?.permissions.canManageUsers) {
+    if (!canManageUsers) {
       pushToast('error', 'Недостаточно прав для управления пользователями.')
       return
     }
@@ -1529,6 +2649,7 @@ export default function App() {
         password: userPassword.trim() || undefined,
         role: userRole,
         active: userActive,
+        permissions: userPermissions,
       }
 
       if (editingUserId) {
@@ -1640,10 +2761,12 @@ export default function App() {
         name: modelName.trim(),
         refillable: modelRefillable,
         minimumQuantity: Math.max(0, modelMinimumQuantity),
+        compatiblePrinterModels: parseCompatiblePrinterModels(modelCompatiblePrintersText),
       })
       setModelName('')
       setModelRefillable(true)
       setModelMinimumQuantity(0)
+      setModelCompatiblePrintersText('')
     }, 'Модель картриджа создана.')
   }
 
@@ -1683,12 +2806,14 @@ export default function App() {
         await createCartridge({
           cartridgeModelId: model.id,
           quantity: Math.max(0, entry.quantity),
+          status: batchTargetStatus,
           comment: entry.comment.trim(),
         })
       }
       setSelectedBatchModelIds([])
       setBatchEntries({})
       setActiveBatchIndex(0)
+      setBatchTargetStatus('IN_STOCK')
       setActiveTab('stock')
     }, 'Партия картриджей добавлена в остаток.')
   }
@@ -1699,6 +2824,12 @@ export default function App() {
         name: model.name,
         refillable: model.refillable,
         minimumQuantity: Math.max(0, model.minimumQuantity ?? 0),
+        compatiblePrinterModels: model.compatiblePrinterModels ?? [],
+      })
+      setModelCompatibilityDrafts((current) => {
+        const next = { ...current }
+        delete next[model.id]
+        return next
       })
     }, `Параметры модели "${model.name}" сохранены.`)
   }
@@ -1719,18 +2850,34 @@ export default function App() {
   function resetPrinterForm() {
     setEditingPrinterId(null)
     setPrinterName('')
+    setPrinterModel('')
+    setPrinterIpAddress('')
+    setPrinterSerialNumber('')
     setPrinterDepartmentId('')
     setPrinterRoomId('')
-    setPrinterType('MONOCHROME')
+    setPrinterDeviceType('PRINTER')
+    setPrinterColorMode('MONOCHROME')
+    setPrinterStatus('IN_OPERATION')
+    setPrinterCommissionedAt('')
+    setPrinterWrittenOffAt('')
+    setPrinterComment('')
     setPrinterSlots([{ name: 'Основной', cartridgeModelId: '' }])
   }
 
   function beginPrinterEdit(printer: Printer) {
     setEditingPrinterId(printer.id ?? null)
     setPrinterName(printer.name)
+    setPrinterModel(printer.model ?? '')
+    setPrinterIpAddress(printer.ipAddress ?? '')
+    setPrinterSerialNumber(printer.serialNumber ?? '')
     setPrinterDepartmentId(printer.departmentId ?? '')
     setPrinterRoomId(printer.roomId ?? '')
-    setPrinterType(printer.printerType)
+    setPrinterDeviceType(printer.deviceType)
+    setPrinterColorMode(printer.colorMode)
+    setPrinterStatus(printer.status)
+    setPrinterCommissionedAt(printer.commissionedAt ?? '')
+    setPrinterWrittenOffAt(printer.writtenOffAt ?? '')
+    setPrinterComment(printer.comment ?? '')
     setPrinterSlots(
       (printer.slots ?? []).map((slot) => ({
         name: slot.name,
@@ -1740,9 +2887,9 @@ export default function App() {
     setActiveTab('printers')
   }
 
-  function applyPrinterType(type: PrinterType) {
-    setPrinterType(type)
-    if (type === 'MONOCHROME') {
+  function applyPrinterColorMode(colorMode: PrinterColorMode) {
+    setPrinterColorMode(colorMode)
+    if (colorMode === 'MONOCHROME') {
       setPrinterSlots((current) => [
         {
           name: current[0]?.name?.trim() ? current[0].name : 'Основной',
@@ -1774,16 +2921,47 @@ export default function App() {
       pushToast('error', 'Выберите отдел для принтера.')
       return
     }
+    if (!printerRoomId) {
+      pushToast('error', 'Выберите кабинет для принтера.')
+      return
+    }
     if (printerSlots.some((slot) => !slot.name.trim() || !slot.cartridgeModelId)) {
       pushToast('error', 'У каждого слота должно быть имя и модель картриджа.')
       return
     }
 
+    const incompatibleSlots = printerSlots
+      .map((slot) => ({
+        slotName: slot.name.trim(),
+        cartridgeModel: models.find((model) => model.id === Number(slot.cartridgeModelId)),
+      }))
+      .filter(
+        (item): item is { slotName: string; cartridgeModel: CartridgeModel } =>
+          Boolean(item.cartridgeModel) &&
+          !isCartridgeModelCompatibleWithPrinter(item.cartridgeModel!, printerModel),
+      )
+
+    if (printerModel.trim() && incompatibleSlots.length > 0) {
+      const summary = incompatibleSlots
+        .map((item) => `${item.slotName}: ${item.cartridgeModel.name}`)
+        .join('; ')
+      pushToast('error', `Для модели принтера "${printerModel.trim()}" выбраны несовместимые картриджи: ${summary}.`)
+      return
+    }
+
     const payload = {
       name: printerName.trim(),
+      model: printerModel.trim() || undefined,
+      ipAddress: printerIpAddress.trim() || undefined,
+      serialNumber: printerSerialNumber.trim() || undefined,
       departmentId: printerDepartmentId,
-      roomId: printerRoomId || undefined,
-      printerType,
+      roomId: printerRoomId,
+      deviceType: printerDeviceType,
+      colorMode: printerColorMode,
+      status: printerStatus,
+      commissionedAt: printerCommissionedAt || undefined,
+      writtenOffAt: printerStatus === 'WRITTEN_OFF' ? printerWrittenOffAt || undefined : undefined,
+      comment: printerComment.trim() || undefined,
       slots: printerSlots.map((slot) => ({
         name: slot.name.trim(),
         cartridgeModelId: Number(slot.cartridgeModelId),
@@ -1874,6 +3052,24 @@ export default function App() {
     }
   }
 
+  async function onExportStockSnapshotXlsx() {
+    try {
+      const blob = await downloadStockSnapshotReportXlsx()
+      saveBlob(blob, 'stock-snapshot-report.xlsx')
+    } catch (e) {
+      pushToast('error', e instanceof Error ? e.message : 'Не удалось выгрузить Excel-отчет по остаткам.')
+    }
+  }
+
+  async function onExportStockSnapshotPdf() {
+    try {
+      const blob = await downloadStockSnapshotReportPdf()
+      saveBlob(blob, 'stock-snapshot-report.pdf')
+    } catch (e) {
+      pushToast('error', e instanceof Error ? e.message : 'Не удалось выгрузить PDF-отчет по остаткам.')
+    }
+  }
+
   return (
     <div className="app-shell">
       {!isAuthed && (
@@ -1949,19 +3145,25 @@ export default function App() {
         <button className={activeTab === 'printers' ? 'active' : ''} onClick={() => setActiveTab('printers')}>
           Принтеры
         </button>
-        <button className={activeTab === 'history' ? 'active' : ''} onClick={() => setActiveTab('history')}>
-          История
-        </button>
-        <button className={activeTab === 'create' ? 'active' : ''} onClick={() => setActiveTab('create')}>
-          Пополнение
-        </button>
+        {canViewLogs && (
+          <button className={activeTab === 'history' ? 'active' : ''} onClick={() => setActiveTab('history')}>
+            История
+          </button>
+        )}
+        {canOperate && (
+          <button className={activeTab === 'create' ? 'active' : ''} onClick={() => setActiveTab('create')}>
+            Пополнение
+          </button>
+        )}
         <button className={activeTab === 'notifications' ? 'active' : ''} onClick={() => setActiveTab('notifications')}>
           Уведомления
         </button>
-        <button className={activeTab === 'reports' ? 'active' : ''} onClick={() => setActiveTab('reports')}>
-          Отчеты
-        </button>
-        {authUser?.permissions.canManageUsers && (
+        {canExportReports && (
+          <button className={activeTab === 'reports' ? 'active' : ''} onClick={() => setActiveTab('reports')}>
+            Отчеты
+          </button>
+        )}
+        {canManageUsers && (
           <button className={activeTab === 'users' ? 'active' : ''} onClick={() => setActiveTab('users')}>
             Пользователи
           </button>
@@ -1989,24 +3191,62 @@ export default function App() {
 
             <div className="stat-grid">
               <article className="stat-card accent-cyan">
-                <span className="stat-label">На складе</span>
-                <strong>{dashboardStats.inStock}</strong>
-                <p>готово к установке</p>
+                <span className="stat-label">Всего принтеров</span>
+                <strong>{dashboardStats.totalPrinters}</strong>
+                <p>{dashboardStats.printersInOperation} в эксплуатации</p>
               </article>
               <article className="stat-card accent-lime">
-                <span className="stat-label">Всего единиц</span>
-                <strong>{dashboardStats.totalUnits}</strong>
-                <p>по всем позициям</p>
+                <span className="stat-label">Всего картриджей</span>
+                <strong>{dashboardStats.totalCartridgeUnits}</strong>
+                <p>по всем статусам</p>
               </article>
               <article className="stat-card accent-amber">
-                <span className="stat-label">На заправке</span>
-                <strong>{dashboardStats.onRefill}</strong>
-                <p>нужен контроль возврата</p>
+                <span className="stat-label">Активные уведомления</span>
+                <strong>{dashboardStats.alertCount}</strong>
+                <p>позиции ниже порога</p>
               </article>
               <article className="stat-card accent-steel">
-                <span className="stat-label">Установлены</span>
-                <strong>{dashboardStats.installed}</strong>
-                <p>сейчас в работе</p>
+                <span className="stat-label">На заправке</span>
+                <strong>{dashboardStats.cartridgesOnRefill}</strong>
+                <p>нужен контроль возврата</p>
+              </article>
+            </div>
+
+            <div className="overview-summary-grid">
+              <article className="side-card">
+                <p className="eyebrow">Printers</p>
+                <h3>Сводка по принтерам</h3>
+                <div className="overview-chip-grid">
+                  <span className="status-badge status-ready">В эксплуатации: {dashboardStats.printersInOperation}</span>
+                  <span className="status-badge status-installed">На складе: {dashboardStats.printersInStock}</span>
+                  <span className="status-badge status-on_refill">В ремонте: {dashboardStats.printersInRepair}</span>
+                  <span className="status-badge status-written_off">Списано: {dashboardStats.printersWrittenOff}</span>
+                </div>
+              </article>
+
+              <article className="side-card">
+                <p className="eyebrow">Cartridges</p>
+                <h3>Сводка по картриджам</h3>
+                <div className="overview-chip-grid">
+                  <span className="status-badge status-ready">На складе: {dashboardStats.cartridgesInStock}</span>
+                  <span className="status-badge status-reserve">Резерв: {dashboardStats.cartridgesReserve}</span>
+                  <span className="status-badge status-on_refill">На заправке: {dashboardStats.cartridgesOnRefill}</span>
+                  <span className="status-badge status-installed">Установлено: {dashboardStats.cartridgesInstalled}</span>
+                  <span className="status-badge status-written_off">Списано: {dashboardStats.cartridgesWrittenOff}</span>
+                </div>
+              </article>
+
+              <article className="side-card">
+                <p className="eyebrow">Quick Links</p>
+                <h3>Быстрые переходы</h3>
+                <div className="overview-quick-links">
+                  {canOperate && <button className="ghost" type="button" onClick={() => setActiveTab('create')}>Пополнение</button>}
+                  <button className="ghost" type="button" onClick={() => setActiveTab('stock')}>Остатки</button>
+                  <button className="ghost" type="button" onClick={() => setActiveTab('printers')}>Принтеры</button>
+                  <button className="ghost" type="button" onClick={() => setActiveTab('notifications')}>Уведомления</button>
+                  {canExportReports && <button className="ghost" type="button" onClick={() => setActiveTab('reports')}>Отчеты</button>}
+                  {canViewLogs && <button className="ghost" type="button" onClick={() => setActiveTab('history')}>Журнал</button>}
+                </div>
               </article>
             </div>
 
@@ -2215,6 +3455,21 @@ export default function App() {
 
           <aside className="overview-side">
             <section className="side-card">
+              <p className="eyebrow">Alerts</p>
+              <h3>Актуальные уведомления</h3>
+              <div className="department-mini-list">
+                {overviewAlerts.map((alert) => (
+                  <article key={`${alert.cartridgeModelId}-${alert.departmentId}`} className="department-mini-card">
+                    <strong>{alert.cartridgeModelName}</strong>
+                    <p>{alert.departmentName}</p>
+                    <span>Остаток: {alert.currentQuantity} шт. при пороге {alert.thresholdQuantity} шт.</span>
+                  </article>
+                ))}
+                {overviewAlerts.length === 0 && <div className="empty-state">Активных уведомлений сейчас нет.</div>}
+              </div>
+            </section>
+
+            <section className="side-card">
               <p className="eyebrow">Departments</p>
               <h3>Структура отделов</h3>
               <div className="department-mini-list">
@@ -2233,21 +3488,16 @@ export default function App() {
 
             <section className="side-card">
               <p className="eyebrow">Recent</p>
-              <h3>Последние записи истории</h3>
+              <h3>Последние действия</h3>
               <div className="history-preview-list">
-                {topHistory.map((entry) => (
+                {recentActivity.map((entry) => (
                   <article key={entry.id} className="history-preview-card">
-                    <strong>{selectedCartridge?.cartridgeModelName || 'История операций'}</strong>
-                    <p>{formatHistoryStatus(entry.status)} · {entry.quantity} шт.</p>
-                    <span>{entry.sentAt || entry.returnedAt || '-'}</span>
+                    <strong>{entry.targetName}</strong>
+                    <p>{formatActionType(entry.actionType)}</p>
+                    <span>{formatDateTime(entry.createdAt)}</span>
                   </article>
                 ))}
-                {selectedCartridgeId && topHistory.length === 0 && (
-                  <div className="empty-state">Для выбранного картриджа история пока пуста.</div>
-                )}
-                {!selectedCartridgeId && (
-                  <div className="empty-state">Выберите картридж, чтобы увидеть его последние события.</div>
-                )}
+                {recentActivity.length === 0 && <div className="empty-state">Журнал действий пока пуст.</div>}
               </div>
             </section>
           </aside>
@@ -2344,7 +3594,7 @@ export default function App() {
                     <td>{item.cartridgeModelName}</td>
                     <td>{item.departmentName}</td>
                     <td>{item.status === 'INSTALLED' ? '—' : item.quantity}</td>
-                    <td>{item.status === 'IN_STOCK' ? '—' : (item.installedQuantity ?? 0)}</td>
+                    <td>{item.status === 'INSTALLED' ? (item.installedQuantity ?? 0) : '—'}</td>
                     <td>
                       {(() => {
                         const stockState = getStockStateMeta(item)
@@ -2413,6 +3663,33 @@ export default function App() {
                 </p>
               </div>
             </div>
+            <div className="filters">
+              <label>
+                Отдел
+                <select
+                  value={departmentUsageDepartmentFilter}
+                  onChange={(e) =>
+                    setDepartmentUsageDepartmentFilter(e.target.value === 'all' ? 'all' : Number(e.target.value))
+                  }
+                >
+                  <option value="all">Все</option>
+                  {userDepartments.map((department) => (
+                    <option key={department.id} value={department.id}>
+                      {department.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              <label>
+                Поиск
+                <input
+                  value={departmentUsageSearch}
+                  onChange={(e) => setDepartmentUsageSearch(e.target.value)}
+                  placeholder="Отдел, кабинет, принтер, слот, модель"
+                />
+              </label>
+            </div>
             <div className="table-shell">
               <table className="stock-table">
                 <thead>
@@ -2429,7 +3706,7 @@ export default function App() {
                   </tr>
                 </thead>
                 <tbody>
-                  {departmentUsageRows.map((row) => (
+                  {paginatedDepartmentUsageRows.map((row) => (
                     <tr key={row.id}>
                       <td>{row.departmentName}</td>
                       <td>{row.roomName}</td>
@@ -2489,11 +3766,41 @@ export default function App() {
                   ))}
                 </tbody>
               </table>
-              {departmentUsageRows.length === 0 && (
+              {filteredDepartmentUsageRows.length === 0 && (
                 <div className="empty-state">
-                  Точек замены пока нет. Сначала добавьте отдел и укажите в нём точки замены с нужными картриджами.
+                  {departmentUsageRows.length === 0
+                    ? 'Точек замены пока нет. Сначала добавьте отдел и укажите в нём точки замены с нужными картриджами.'
+                    : 'По текущим фильтрам точки замены не найдены.'}
                 </div>
               )}
+            </div>
+            <div className="pagination">
+              <span>
+                Точек замены: {filteredDepartmentUsageRows.length} · Страница {departmentUsagePage} / {departmentUsageTotalPages}
+              </span>
+              <div className="pagination-controls">
+                <button onClick={() => setDepartmentUsagePage(1)} disabled={departmentUsagePage === 1}>
+                  {'<<'}
+                </button>
+                <button
+                  onClick={() => setDepartmentUsagePage((page) => Math.max(1, page - 1))}
+                  disabled={departmentUsagePage === 1}
+                >
+                  {'<'}
+                </button>
+                <button
+                  onClick={() => setDepartmentUsagePage((page) => Math.min(departmentUsageTotalPages, page + 1))}
+                  disabled={departmentUsagePage === departmentUsageTotalPages}
+                >
+                  {'>'}
+                </button>
+                <button
+                  onClick={() => setDepartmentUsagePage(departmentUsageTotalPages)}
+                  disabled={departmentUsagePage === departmentUsageTotalPages}
+                >
+                  {'>>'}
+                </button>
+              </div>
             </div>
           </section>
 
@@ -2523,38 +3830,150 @@ export default function App() {
             <aside className="side-card">
               <p className="eyebrow">Manage Departments</p>
               <h3>Существующие отделы</h3>
+              <div className="inline-filters">
+                <label>
+                  Поиск
+                  <input
+                    value={departmentListSearch}
+                    onChange={(e) => setDepartmentListSearch(e.target.value)}
+                    placeholder="Название или описание"
+                  />
+                </label>
+                <label>
+                  Статус
+                  <select
+                    value={departmentListStatusFilter}
+                    onChange={(e) => setDepartmentListStatusFilter(e.target.value as DepartmentStatus | 'all')}
+                  >
+                    <option value="all">Все</option>
+                    <option value="ACTIVE">Действует</option>
+                    <option value="DECOMMISSIONED">Демонтирован / не используется</option>
+                  </select>
+                </label>
+              </div>
               <div className="department-mini-list">
-                {departments.map((department) => (
+                {paginatedDepartmentCards.map((department) => (
                   <article key={department.id} className="department-mini-card">
                     <strong>{department.name}</strong>
+                    <p>
+                      <span className={`status-badge ${getStructureStatusTone(department.status)}`}>{formatDepartmentStatus(department.status)}</span>
+                    </p>
                     <p>{department.description || 'Без описания'}</p>
                     <div className="table-actions">
                       <button className="ghost" onClick={() => beginDepartmentEdit(department)}>Изменить</button>
-                      <button className="ghost danger-action" onClick={() => onDeleteDepartment(department.id, department.name)}>Удалить</button>
+                      {department.status === 'ACTIVE' && (
+                        <button className="ghost danger-action" onClick={() => onDeleteDepartment(department.id, department.name)}>Вывести из использования</button>
+                      )}
                     </div>
                   </article>
                 ))}
-                {userDepartments.length === 0 && <div className="empty-state">Отделов пока нет.</div>}
+                {filteredDepartmentCards.length === 0 && <div className="empty-state">Подходящих отделов не найдено.</div>}
+              </div>
+              <div className="pagination compact-pagination">
+                <span>
+                  Отделов: {filteredDepartmentCards.length} · Страница {departmentListPage} / {departmentListTotalPages}
+                </span>
+                <div className="pagination-controls">
+                  <button onClick={() => setDepartmentListPage(1)} disabled={departmentListPage === 1}>
+                    {'<<'}
+                  </button>
+                  <button
+                    onClick={() => setDepartmentListPage((page) => Math.max(1, page - 1))}
+                    disabled={departmentListPage === 1}
+                  >
+                    {'<'}
+                  </button>
+                  <button
+                    onClick={() => setDepartmentListPage((page) => Math.min(departmentListTotalPages, page + 1))}
+                    disabled={departmentListPage === departmentListTotalPages}
+                  >
+                    {'>'}
+                  </button>
+                  <button
+                    onClick={() => setDepartmentListPage(departmentListTotalPages)}
+                    disabled={departmentListPage === departmentListTotalPages}
+                  >
+                    {'>>'}
+                  </button>
+                </div>
               </div>
             </aside>
 
             <aside className="side-card">
               <p className="eyebrow">Manage Rooms</p>
               <h3>Кабинеты и залы</h3>
+              <div className="inline-filters">
+                <label>
+                  Отдел
+                  <select
+                    value={roomListDepartmentFilter}
+                    onChange={(e) => setRoomListDepartmentFilter(e.target.value === 'all' ? 'all' : Number(e.target.value))}
+                  >
+                    <option value="all">Все</option>
+                    {userDepartments.map((department) => (
+                      <option key={department.id} value={department.id}>
+                        {department.name}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label>
+                  Статус
+                  <select value={roomListStatusFilter} onChange={(e) => setRoomListStatusFilter(e.target.value as RoomStatus | 'all')}>
+                    <option value="all">Все</option>
+                    <option value="ACTIVE">Действует</option>
+                    <option value="DECOMMISSIONED">Демонтирован / не используется</option>
+                  </select>
+                </label>
+                <label>
+                  Поиск
+                  <input
+                    value={roomListSearch}
+                    onChange={(e) => setRoomListSearch(e.target.value)}
+                    placeholder="Кабинет, зал, комментарий"
+                  />
+                </label>
+              </div>
               <div className="department-mini-list">
-                {rooms.map((room) => (
+                {paginatedRoomCards.map((room) => (
                   <article key={room.id} className="department-mini-card">
                     <strong>{room.name}</strong>
                     <p>{room.departmentName}</p>
-                    <p>{room.status === 'ACTIVE' ? 'Действует' : 'Демонтирован / не используется'}</p>
+                    <p>
+                      <span className={`status-badge ${getStructureStatusTone(room.status)}`}>{formatRoomStatus(room.status)}</span>
+                    </p>
                     <p>{room.comment || 'Без комментария'}</p>
                     <div className="table-actions">
                       <button className="ghost" onClick={() => beginRoomEdit(room)}>Изменить</button>
-                      <button className="ghost danger-action" onClick={() => onDeleteRoom(room.id, room.name)}>Удалить</button>
+                      {room.status === 'ACTIVE' && (
+                        <button className="ghost danger-action" onClick={() => onDeleteRoom(room.id, room.name)}>Вывести из использования</button>
+                      )}
                     </div>
                   </article>
                 ))}
-                {rooms.length === 0 && <div className="empty-state">Кабинетов пока нет.</div>}
+                {filteredRoomCards.length === 0 && <div className="empty-state">Подходящих кабинетов не найдено.</div>}
+              </div>
+              <div className="pagination compact-pagination">
+                <span>
+                  Кабинетов: {filteredRoomCards.length} · Страница {roomListPage} / {roomListTotalPages}
+                </span>
+                <div className="pagination-controls">
+                  <button onClick={() => setRoomListPage(1)} disabled={roomListPage === 1}>
+                    {'<<'}
+                  </button>
+                  <button onClick={() => setRoomListPage((page) => Math.max(1, page - 1))} disabled={roomListPage === 1}>
+                    {'<'}
+                  </button>
+                  <button
+                    onClick={() => setRoomListPage((page) => Math.min(roomListTotalPages, page + 1))}
+                    disabled={roomListPage === roomListTotalPages}
+                  >
+                    {'>'}
+                  </button>
+                  <button onClick={() => setRoomListPage(roomListTotalPages)} disabled={roomListPage === roomListTotalPages}>
+                    {'>>'}
+                  </button>
+                </div>
               </div>
             </aside>
 
@@ -2566,6 +3985,13 @@ export default function App() {
                 <label>
                   Название
                   <input value={departmentName} onChange={(e) => setDepartmentName(e.target.value)} />
+                </label>
+                <label>
+                  Статус
+                  <select value={departmentStatus} onChange={(e) => setDepartmentStatus(e.target.value as DepartmentStatus)}>
+                    <option value="ACTIVE">Действует</option>
+                    <option value="DECOMMISSIONED">Демонтирован / не используется</option>
+                  </select>
                 </label>
                 <label>
                   Описание
@@ -2598,9 +4024,10 @@ export default function App() {
                   Отдел
                   <select value={roomDepartmentId} onChange={(e) => setRoomDepartmentId(e.target.value ? Number(e.target.value) : '')}>
                     <option value="">Выберите...</option>
-                    {userDepartments.map((department) => (
+                    {availableDepartmentsForRoomForm.map((department) => (
                       <option key={department.id} value={department.id}>
                         {department.name}
+                        {department.status === 'DECOMMISSIONED' ? ' (архивный отдел)' : ''}
                       </option>
                     ))}
                   </select>
@@ -2640,6 +4067,45 @@ export default function App() {
                 <p className="table-hint">Для цветных принтеров каждый цвет ведется как отдельный слот с собственной заменой.</p>
               </div>
             </div>
+            <div className="filters">
+              <label>
+                Отдел
+                <select
+                  value={printerDepartmentFilter}
+                  onChange={(e) => setPrinterDepartmentFilter(e.target.value === 'all' ? 'all' : Number(e.target.value))}
+                >
+                  <option value="all">Все</option>
+                  {userDepartments.map((department) => (
+                    <option key={department.id} value={department.id}>
+                      {department.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              <label>
+                Статус
+                <select
+                  value={printerStatusFilter}
+                  onChange={(e) => setPrinterStatusFilter(e.target.value as PrinterStatus | 'all')}
+                >
+                  <option value="all">Все</option>
+                  <option value="IN_OPERATION">В эксплуатации</option>
+                  <option value="IN_STOCK">На складе</option>
+                  <option value="IN_REPAIR">В ремонте</option>
+                  <option value="WRITTEN_OFF">Списан</option>
+                </select>
+              </label>
+
+              <label>
+                Поиск
+                <input
+                  value={printerSearchTerm}
+                  onChange={(e) => setPrinterSearchTerm(e.target.value)}
+                  placeholder="Принтер, модель, IP, серийный номер"
+                />
+              </label>
+            </div>
             <div className="table-shell">
               <table className="stock-table">
                 <thead>
@@ -2653,12 +4119,24 @@ export default function App() {
                   </tr>
                 </thead>
                 <tbody>
-                  {printers.map((printer) => (
+                  {paginatedPrinters.map((printer) => (
                     <tr key={printer.id}>
                       <td>{printer.departmentName}</td>
                       <td>{printer.roomName || '-'}</td>
-                      <td>{printer.name}</td>
-                      <td>{printer.printerType === 'COLOR' ? 'Цветной' : 'Ч/Б'}</td>
+                      <td>
+                        <div className="replacement-point-state">
+                          <strong>{printer.name}</strong>
+                          <span>{printer.model || 'Модель не указана'}</span>
+                          <span>{printer.ipAddress || 'IP не указан'}</span>
+                        </div>
+                      </td>
+                      <td>
+                        <div className="replacement-point-state">
+                          <span>{formatPrinterDeviceType(printer.deviceType)}</span>
+                          <span>{formatPrinterColorMode(printer.colorMode)}</span>
+                          <span>{formatPrinterStatus(printer.status)}</span>
+                        </div>
+                      </td>
                       <td>
                         <div className="replacement-point-state">
                           {printer.slots.map((slot) => (
@@ -2671,14 +4149,36 @@ export default function App() {
                       <td>
                         <div className="table-actions">
                           <button className="ghost" onClick={() => beginPrinterEdit(printer)}>Изменить</button>
-                          <button className="ghost danger-action" onClick={() => onDeletePrinter(printer.id!, printer.name)}>Удалить</button>
+                          <button className="ghost danger-action" onClick={() => onDeletePrinter(printer.id!, printer.name)}>Списать</button>
                         </div>
                       </td>
                     </tr>
                   ))}
                 </tbody>
               </table>
-              {printers.length === 0 && <div className="empty-state">Принтеров пока нет.</div>}
+              {filteredPrinters.length === 0 && <div className="empty-state">Подходящих принтеров не найдено.</div>}
+            </div>
+            <div className="pagination">
+              <span>
+                Принтеров: {filteredPrinters.length} · Страница {printerPage} / {printerTotalPages}
+              </span>
+              <div className="pagination-controls">
+                <button onClick={() => setPrinterPage(1)} disabled={printerPage === 1}>
+                  {'<<'}
+                </button>
+                <button onClick={() => setPrinterPage((page) => Math.max(1, page - 1))} disabled={printerPage === 1}>
+                  {'<'}
+                </button>
+                <button
+                  onClick={() => setPrinterPage((page) => Math.min(printerTotalPages, page + 1))}
+                  disabled={printerPage === printerTotalPages}
+                >
+                  {'>'}
+                </button>
+                <button onClick={() => setPrinterPage(printerTotalPages)} disabled={printerPage === printerTotalPages}>
+                  {'>>'}
+                </button>
+              </div>
             </div>
           </section>
 
@@ -2692,10 +4192,29 @@ export default function App() {
                   <input value={printerName} onChange={(e) => setPrinterName(e.target.value)} />
                 </label>
                 <label>
+                  Модель
+                  <input value={printerModel} onChange={(e) => setPrinterModel(e.target.value)} />
+                </label>
+                {printerModel.trim() && hasExplicitPrinterCompatibility && (
+                  <p className="table-muted">
+                    {printerStrictCompatibleModels.length > 0
+                      ? `По совместимости подходят: ${printerStrictCompatibleModels.map((model) => model.name).join(', ')}.`
+                      : 'Для этой модели принтера явная совместимость не найдена. В списках слотов доступны только универсальные модели без заполненной совместимости.'}
+                  </p>
+                )}
+                <label>
+                  IP-адрес
+                  <input value={printerIpAddress} onChange={(e) => setPrinterIpAddress(e.target.value)} placeholder="192.168.0.10" />
+                </label>
+                <label>
+                  Серийный номер
+                  <input value={printerSerialNumber} onChange={(e) => setPrinterSerialNumber(e.target.value)} />
+                </label>
+                <label>
                   Отдел
                   <select value={printerDepartmentId} onChange={(e) => setPrinterDepartmentId(e.target.value ? Number(e.target.value) : '')}>
                     <option value="">Выберите...</option>
-                    {userDepartments.map((department) => (
+                    {activeUserDepartments.map((department) => (
                       <option key={department.id} value={department.id}>
                         {department.name}
                       </option>
@@ -2703,13 +4222,13 @@ export default function App() {
                   </select>
                 </label>
                 <label>
-                  Кабинет (опционально)
+                  Кабинет
                   <select
                     value={printerRoomId}
                     onChange={(e) => setPrinterRoomId(e.target.value ? Number(e.target.value) : '')}
                     disabled={!printerDepartmentId}
                   >
-                    <option value="">Не выбран</option>
+                    <option value="">Выберите...</option>
                     {availableRoomsForPrinter.map((room) => (
                       <option key={room.id} value={room.id}>
                         {room.name}
@@ -2718,41 +4237,95 @@ export default function App() {
                   </select>
                 </label>
                 <label>
-                  Тип принтера
-                  <select value={printerType} onChange={(e) => applyPrinterType(e.target.value as PrinterType)}>
+                  Тип устройства
+                  <select value={printerDeviceType} onChange={(e) => setPrinterDeviceType(e.target.value as PrinterDeviceType)}>
+                    <option value="PRINTER">Принтер</option>
+                    <option value="MFP">МФУ</option>
+                  </select>
+                </label>
+                <label>
+                  Цветность
+                  <select value={printerColorMode} onChange={(e) => applyPrinterColorMode(e.target.value as PrinterColorMode)}>
                     <option value="MONOCHROME">Ч/Б</option>
                     <option value="COLOR">Цветной</option>
                   </select>
                 </label>
+                <label>
+                  Статус
+                  <select value={printerStatus} onChange={(e) => setPrinterStatus(e.target.value as PrinterStatus)}>
+                    <option value="IN_OPERATION">В эксплуатации</option>
+                    <option value="IN_STOCK">На складе</option>
+                    <option value="IN_REPAIR">В ремонте</option>
+                    <option value="WRITTEN_OFF">Списан</option>
+                  </select>
+                </label>
+                <label>
+                  Дата ввода в эксплуатацию
+                  <input type="date" value={printerCommissionedAt} onChange={(e) => setPrinterCommissionedAt(e.target.value)} />
+                </label>
+                <label>
+                  Дата списания
+                  <input
+                    type="date"
+                    value={printerWrittenOffAt}
+                    onChange={(e) => setPrinterWrittenOffAt(e.target.value)}
+                    disabled={printerStatus !== 'WRITTEN_OFF'}
+                  />
+                </label>
+                <label>
+                  Комментарий
+                  <textarea value={printerComment} onChange={(e) => setPrinterComment(e.target.value)} rows={3} />
+                </label>
                 <div className="dynamic-list">
                   <span className="field-label">Слоты картриджей</span>
                   {printerSlots.map((slot, index) => (
-                    <div key={index} className="dynamic-row">
-                      <input
-                        value={slot.name}
-                        onChange={(e) =>
-                          setPrinterSlots((current) => current.map((item, itemIndex) => itemIndex === index ? { ...item, name: e.target.value } : item))
+                    <div key={index}>
+                      <div className="dynamic-row">
+                        <input
+                          value={slot.name}
+                          onChange={(e) =>
+                            setPrinterSlots((current) => current.map((item, itemIndex) => itemIndex === index ? { ...item, name: e.target.value } : item))
+                          }
+                          placeholder={`Слот ${index + 1}`}
+                          disabled={printerColorMode === 'COLOR' && ['Black', 'Cyan', 'Magenta', 'Yellow'].includes(slot.name)}
+                        />
+                        <select
+                          value={slot.cartridgeModelId}
+                          onChange={(e) =>
+                            setPrinterSlots((current) =>
+                              current.map((item, itemIndex) =>
+                                itemIndex === index ? { ...item, cartridgeModelId: e.target.value ? Number(e.target.value) : '' } : item,
+                              ),
+                            )
+                          }
+                        >
+                          <option value="">Модель картриджа</option>
+                          {models.map((model) => {
+                            const isCompatible = printerCompatibleModels.some((item) => item.id === model.id)
+                            const isSelectedIncompatible = slot.cartridgeModelId === model.id && !isCompatible
+                            return (
+                              <option
+                                key={model.id}
+                                value={model.id}
+                                disabled={!isCompatible && !isSelectedIncompatible}
+                              >
+                                {isCompatible ? model.name : `${model.name} (не подходит)`}
+                              </option>
+                            )
+                          })}
+                        </select>
+                      </div>
+                      {(() => {
+                        const selectedModel = models.find((model) => model.id === slot.cartridgeModelId)
+                        if (!selectedModel || isCartridgeModelCompatibleWithPrinter(selectedModel, printerModel)) {
+                          return null
                         }
-                        placeholder={`Слот ${index + 1}`}
-                        disabled={printerType === 'COLOR' && ['Black', 'Cyan', 'Magenta', 'Yellow'].includes(slot.name)}
-                      />
-                      <select
-                        value={slot.cartridgeModelId}
-                        onChange={(e) =>
-                          setPrinterSlots((current) =>
-                            current.map((item, itemIndex) =>
-                              itemIndex === index ? { ...item, cartridgeModelId: e.target.value ? Number(e.target.value) : '' } : item,
-                            ),
-                          )
-                        }
-                      >
-                        <option value="">Модель картриджа</option>
-                        {models.map((model) => (
-                          <option key={model.id} value={model.id}>
-                            {model.name}
-                          </option>
-                        ))}
-                      </select>
+                        return (
+                          <p className="danger-text table-spacing-sm">
+                            Для слота "{slot.name || `#${index + 1}`}" выбрана несовместимая модель: {selectedModel.name}.
+                          </p>
+                        )
+                      })()}
                     </div>
                   ))}
                 </div>
@@ -2766,7 +4339,7 @@ export default function App() {
         </section>
       )}
 
-      {activeTab === 'history' && (
+      {activeTab === 'history' && canViewLogs && (
         <section className="panel">
           <div className="section-heading">
             <div>
@@ -2805,6 +4378,32 @@ export default function App() {
               </select>
             </label>
             <label>
+              Сущность
+              <select
+                value={historyEntityType}
+                onChange={(event) => setHistoryEntityType(event.target.value)}
+              >
+                {ACTION_LOG_ENTITY_OPTIONS.map((option) => (
+                  <option key={option.value || 'all'} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label>
+              Результат
+              <select
+                value={historyResult}
+                onChange={(event) => setHistoryResult(event.target.value)}
+              >
+                {ACTION_LOG_RESULT_OPTIONS.map((option) => (
+                  <option key={option.value || 'all'} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label>
               Кто
               <input
                 type="text"
@@ -2822,31 +4421,77 @@ export default function App() {
                 onChange={(event) => setHistoryTargetName(event.target.value)}
               />
             </label>
+            <label>
+              Быстрый поиск
+              <input
+                type="text"
+                value={historySearchTerm}
+                placeholder="Подробности, устройство, old/new"
+                onChange={(event) => setHistorySearchTerm(event.target.value)}
+              />
+            </label>
           </div>
           <div className="table-shell">
             <table className="stock-table">
               <thead>
                 <tr>
                   <th>Когда</th>
+                  <th>Сущность</th>
+                  <th>Результат</th>
                   <th>Действие</th>
                   <th>Объект</th>
                   <th>Подробности</th>
                   <th>Кто</th>
+                  <th>Устройство</th>
+                  <th>Изменения</th>
                 </tr>
               </thead>
               <tbody>
-                {actionLogs.map((entry) => (
+                {paginatedActionLogs.map((entry) => (
                   <tr key={entry.id}>
                     <td>{entry.createdAt.replace('T', ' ').slice(0, 16)}</td>
+                    <td>{formatActionEntityType(entry.entityType)}</td>
+                    <td>{formatActionResult(entry.result)}</td>
                     <td>{formatActionType(entry.actionType)}</td>
                     <td>{entry.targetName}</td>
-                    <td>{entry.details || '-'}</td>
+                    <td>
+                      {entry.details || '-'}
+                      {entry.manualDateTime && <div className="table-muted">Ручная дата/время</div>}
+                    </td>
                     <td>{entry.actor || '-'}</td>
+                    <td>{entry.deviceInfo || '-'}</td>
+                    <td>
+                      {entry.oldValues && <div><strong>Было:</strong> {entry.oldValues}</div>}
+                      {entry.newValues && <div><strong>Стало:</strong> {entry.newValues}</div>}
+                      {!entry.oldValues && !entry.newValues && '-'}
+                    </td>
                   </tr>
                 ))}
               </tbody>
             </table>
-            {actionLogs.length === 0 && <div className="empty-state">Записей пока нет.</div>}
+            {filteredActionLogs.length === 0 && <div className="empty-state">Записей по текущим фильтрам не найдено.</div>}
+          </div>
+          <div className="pagination">
+            <span>
+              Записей: {filteredActionLogs.length} · Страница {historyPage} / {historyTotalPages}
+            </span>
+            <div className="pagination-controls">
+              <button onClick={() => setHistoryPage(1)} disabled={historyPage === 1}>
+                {'<<'}
+              </button>
+              <button onClick={() => setHistoryPage((page) => Math.max(1, page - 1))} disabled={historyPage === 1}>
+                {'<'}
+              </button>
+              <button
+                onClick={() => setHistoryPage((page) => Math.min(historyTotalPages, page + 1))}
+                disabled={historyPage === historyTotalPages}
+              >
+                {'>'}
+              </button>
+              <button onClick={() => setHistoryPage(historyTotalPages)} disabled={historyPage === historyTotalPages}>
+                {'>>'}
+              </button>
+            </div>
           </div>
         </section>
       )}
@@ -2860,6 +4505,39 @@ export default function App() {
                 <p className="table-hint">Показываются позиции, где остаток достиг или пересек заданный порог.</p>
               </div>
             </div>
+            <div className="filters">
+              <label>
+                Отдел
+                <select
+                  value={notificationAlertDepartmentFilter}
+                  onChange={(e) => setNotificationAlertDepartmentFilter(e.target.value === 'all' ? 'all' : Number(e.target.value))}
+                >
+                  <option value="all">Все отделы</option>
+                  {userDepartments.map((department) => (
+                    <option key={department.id} value={department.id}>
+                      {department.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                Источник
+                <select value={notificationAlertSourceFilter} onChange={(e) => setNotificationAlertSourceFilter(e.target.value)}>
+                  <option value="all">Все источники</option>
+                  <option value="DEPARTMENT">Отдел</option>
+                  <option value="MODEL_DEFAULT">Модель</option>
+                  <option value="MODEL_MINIMUM">Минимум модели</option>
+                </select>
+              </label>
+              <label>
+                Поиск
+                <input
+                  value={notificationAlertSearch}
+                  onChange={(e) => setNotificationAlertSearch(e.target.value)}
+                  placeholder="Отдел или модель"
+                />
+              </label>
+            </div>
             <div className="table-shell">
               <table className="stock-table">
                 <thead>
@@ -2872,7 +4550,7 @@ export default function App() {
                   </tr>
                 </thead>
                 <tbody>
-                  {notificationAlerts.map((alert) => (
+                  {paginatedNotificationAlerts.map((alert) => (
                     <tr key={`${alert.departmentId}-${alert.cartridgeModelId}`}>
                       <td>{alert.departmentName}</td>
                       <td>{alert.cartridgeModelName}</td>
@@ -2889,16 +4567,77 @@ export default function App() {
                   ))}
                 </tbody>
               </table>
-              {notificationAlerts.length === 0 && <div className="empty-state">Нехватки по текущим порогам не найдено.</div>}
+              {filteredNotificationAlerts.length === 0 && <div className="empty-state">Нехватки по текущим фильтрам не найдено.</div>}
+            </div>
+            <div className="pagination">
+              <span>
+                Уведомлений: {filteredNotificationAlerts.length} · Страница {notificationAlertPage} / {notificationAlertTotalPages}
+              </span>
+              <div className="pagination-controls">
+                <button onClick={() => setNotificationAlertPage(1)} disabled={notificationAlertPage === 1}>
+                  {'<<'}
+                </button>
+                <button
+                  onClick={() => setNotificationAlertPage((page) => Math.max(1, page - 1))}
+                  disabled={notificationAlertPage === 1}
+                >
+                  {'<'}
+                </button>
+                <button
+                  onClick={() => setNotificationAlertPage((page) => Math.min(notificationAlertTotalPages, page + 1))}
+                  disabled={notificationAlertPage === notificationAlertTotalPages}
+                >
+                  {'>'}
+                </button>
+                <button
+                  onClick={() => setNotificationAlertPage(notificationAlertTotalPages)}
+                  disabled={notificationAlertPage === notificationAlertTotalPages}
+                >
+                  {'>>'}
+                </button>
+              </div>
             </div>
           </section>
 
           <div className="departments-bottom">
-            <aside className="side-card">
+            {canManageThresholds && (
+              <aside className="side-card">
               <p className="eyebrow">Thresholds</p>
               <h3>Настройки порогов</h3>
+              <div className="inline-filters">
+                <label>
+                  Отдел
+                  <select
+                    value={thresholdDepartmentFilter}
+                    onChange={(e) => setThresholdDepartmentFilter(e.target.value === 'all' ? 'all' : Number(e.target.value))}
+                  >
+                    <option value="all">Все отделы</option>
+                    {userDepartments.map((department) => (
+                      <option key={department.id} value={department.id}>
+                        {department.name}
+                      </option>
+                    ))}
+                  </select>
+                </label>
+                <label>
+                  Статус
+                  <select value={thresholdActiveFilter} onChange={(e) => setThresholdActiveFilter(e.target.value as 'all' | 'active' | 'inactive')}>
+                    <option value="all">Все</option>
+                    <option value="active">Активен</option>
+                    <option value="inactive">Отключен</option>
+                  </select>
+                </label>
+                <label>
+                  Поиск
+                  <input
+                    value={thresholdSearchTerm}
+                    onChange={(e) => setThresholdSearchTerm(e.target.value)}
+                    placeholder="Модель, отдел, комментарий"
+                  />
+                </label>
+              </div>
               <div className="department-mini-list">
-                {notificationThresholds.map((item) => (
+                {paginatedThresholds.map((item) => (
                   <article key={item.id} className="department-mini-card">
                     <strong>{item.cartridgeModelName}</strong>
                     <p>Отдел: {item.departmentName || 'Все отделы'}</p>
@@ -2916,11 +4655,35 @@ export default function App() {
                     </div>
                   </article>
                 ))}
-                {notificationThresholds.length === 0 && <div className="empty-state">Порогов пока нет.</div>}
+                {filteredThresholds.length === 0 && <div className="empty-state">Порогов по текущим фильтрам не найдено.</div>}
               </div>
-            </aside>
+              <div className="pagination compact-pagination">
+                <span>
+                  Порогов: {filteredThresholds.length} · Страница {thresholdPage} / {thresholdTotalPages}
+                </span>
+                <div className="pagination-controls">
+                  <button onClick={() => setThresholdPage(1)} disabled={thresholdPage === 1}>
+                    {'<<'}
+                  </button>
+                  <button onClick={() => setThresholdPage((page) => Math.max(1, page - 1))} disabled={thresholdPage === 1}>
+                    {'<'}
+                  </button>
+                  <button
+                    onClick={() => setThresholdPage((page) => Math.min(thresholdTotalPages, page + 1))}
+                    disabled={thresholdPage === thresholdTotalPages}
+                  >
+                    {'>'}
+                  </button>
+                  <button onClick={() => setThresholdPage(thresholdTotalPages)} disabled={thresholdPage === thresholdTotalPages}>
+                    {'>>'}
+                  </button>
+                </div>
+              </div>
+              </aside>
+            )}
 
-            <aside className="side-card">
+            {canManageThresholds && (
+              <aside className="side-card">
               <p className="eyebrow">Create Threshold</p>
               <h3>{editingThresholdId ? 'Изменить порог' : 'Добавить порог'}</h3>
               <form onSubmit={onSaveThreshold} className="form-card compact-form">
@@ -2976,12 +4739,13 @@ export default function App() {
                   )}
                 </div>
               </form>
-            </aside>
+              </aside>
+            )}
           </div>
         </section>
       )}
 
-      {activeTab === 'reports' && (
+      {activeTab === 'reports' && canExportReports && (
         <section className="panel">
           <div className="section-heading">
             <div>
@@ -2998,6 +4762,14 @@ export default function App() {
             <label>
               По
               <input type="date" value={reportDateTo} onChange={(e) => setReportDateTo(e.target.value)} />
+            </label>
+            <label>
+              Поиск по расходу
+              <input
+                value={reportConsumptionSearchTerm}
+                onChange={(e) => setReportConsumptionSearchTerm(e.target.value)}
+                placeholder="Модель картриджа"
+              />
             </label>
             <div className="table-actions">
               <button type="button" onClick={() => void loadConsumptionReport()}>Обновить</button>
@@ -3020,7 +4792,7 @@ export default function App() {
                 </tr>
               </thead>
               <tbody>
-                {(consumptionReport?.rows ?? []).map((row) => (
+                {paginatedConsumptionRows.map((row) => (
                   <tr key={row.modelName}>
                     <td>{row.modelName}</td>
                     <td>{row.installedQuantity}</td>
@@ -3033,9 +4805,37 @@ export default function App() {
                 ))}
               </tbody>
             </table>
-            {(consumptionReport?.rows.length ?? 0) === 0 && (
-              <div className="empty-state">За выбранный период данных по расходу не найдено.</div>
+            {filteredConsumptionRows.length === 0 && (
+              <div className="empty-state">За выбранный период и по текущему поиску данных не найдено.</div>
             )}
+          </div>
+          <div className="pagination">
+            <span>
+              Строк: {filteredConsumptionRows.length} · Страница {reportConsumptionPage} / {reportConsumptionTotalPages}
+            </span>
+            <div className="pagination-controls">
+              <button onClick={() => setReportConsumptionPage(1)} disabled={reportConsumptionPage === 1}>
+                {'<<'}
+              </button>
+              <button
+                onClick={() => setReportConsumptionPage((page) => Math.max(1, page - 1))}
+                disabled={reportConsumptionPage === 1}
+              >
+                {'<'}
+              </button>
+              <button
+                onClick={() => setReportConsumptionPage((page) => Math.min(reportConsumptionTotalPages, page + 1))}
+                disabled={reportConsumptionPage === reportConsumptionTotalPages}
+              >
+                {'>'}
+              </button>
+              <button
+                onClick={() => setReportConsumptionPage(reportConsumptionTotalPages)}
+                disabled={reportConsumptionPage === reportConsumptionTotalPages}
+              >
+                {'>>'}
+              </button>
+            </div>
           </div>
 
           {consumptionReport && (
@@ -3048,124 +4848,176 @@ export default function App() {
             <>
               <div className="filters">
                 <span className="status-badge status-ready">На складе: {stockSnapshotReport.totalInStock}</span>
+                <span className="status-badge status-reserve">Резерв: {stockSnapshotReport.totalReserve}</span>
                 <span className="status-badge status-on_refill">На заправке: {stockSnapshotReport.totalOnRefill}</span>
                 <span className="status-badge status-installed">Установлено: {stockSnapshotReport.totalInstalled}</span>
                 <span className="status-badge status-written_off">Списано: {stockSnapshotReport.totalWrittenOff}</span>
+                <div className="table-actions">
+                  <button type="button" className="ghost" onClick={() => void onExportStockSnapshotXlsx()}>Остатки Excel</button>
+                  <button type="button" className="ghost" onClick={() => void onExportStockSnapshotPdf()}>Остатки PDF</button>
+                </div>
               </div>
-
-              <div className="table-shell">
-                <table className="stock-table">
-                  <thead>
-                    <tr>
-                      <th>Отдел</th>
-                      <th>На складе</th>
-                      <th>На заправке</th>
-                      <th>Установлено</th>
-                      <th>Списано</th>
-                      <th>Всего</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {stockSnapshotReport.byDepartment.map((row) => (
-                      <tr key={row.departmentId}>
-                        <td>{row.departmentName}</td>
-                        <td>{row.inStockQuantity}</td>
-                        <td>{row.onRefillQuantity}</td>
-                        <td>{row.installedQuantity}</td>
-                        <td>{row.writtenOffQuantity}</td>
-                        <td>{row.totalQuantity}</td>
+              <section className="form-card">
+                <h3>{reportSummaryDataset.title}</h3>
+                <p className="form-help">Выберите нужный разрез сводного отчёта. Для текущего набора доступен поиск и пагинация.</p>
+                <div className="batch-selector-grid">
+                  {[
+                    { value: 'department' as ReportSummaryView, label: 'По отделам', meta: `${stockSnapshotReport.byDepartment.length} строк` },
+                    { value: 'model' as ReportSummaryView, label: 'По моделям', meta: `${stockSnapshotReport.byModel.length} строк` },
+                    { value: 'room' as ReportSummaryView, label: 'По кабинетам', meta: `${stockSnapshotReport.byRoom.length} строк` },
+                    { value: 'type' as ReportSummaryView, label: 'По типам', meta: `${stockSnapshotReport.byType.length} строк` },
+                    { value: 'printer' as ReportSummaryView, label: 'По принтерам', meta: `${stockSnapshotReport.byPrinterModel.length} строк` },
+                  ].map((option) => (
+                    <button
+                      key={option.value}
+                      type="button"
+                      className={`batch-model-chip ${reportSummaryView === option.value ? 'active' : ''}`}
+                      onClick={() => setReportSummaryView(option.value)}
+                    >
+                      <span>{option.label}</span>
+                      <small>{option.meta}</small>
+                    </button>
+                  ))}
+                </div>
+                <div className="filters">
+                  <label>
+                    Поиск по сводке
+                    <input
+                      value={reportSummarySearchTerm}
+                      onChange={(e) => setReportSummarySearchTerm(e.target.value)}
+                      placeholder="Название строки"
+                    />
+                  </label>
+                </div>
+                <div className="table-shell">
+                  <table className="stock-table">
+                    <thead>
+                      <tr>
+                        {reportSummaryDataset.headers.map((header) => (
+                          <th key={header}>{header}</th>
+                        ))}
                       </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
+                    </thead>
+                    <tbody>
+                      {paginatedReportSummaryRows.map((row) => (
+                        <tr key={row.key}>
+                          {row.cells.map((cell, index) => (
+                            <td key={`${row.key}-${index}`}>{cell}</td>
+                          ))}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                  {filteredReportSummaryRows.length === 0 && <div className="empty-state">По текущему поиску строк не найдено.</div>}
+                </div>
+                <div className="pagination">
+                  <span>
+                    Строк: {filteredReportSummaryRows.length} · Страница {reportSummaryPage} / {reportSummaryTotalPages}
+                  </span>
+                  <div className="pagination-controls">
+                    <button onClick={() => setReportSummaryPage(1)} disabled={reportSummaryPage === 1}>
+                      {'<<'}
+                    </button>
+                    <button onClick={() => setReportSummaryPage((page) => Math.max(1, page - 1))} disabled={reportSummaryPage === 1}>
+                      {'<'}
+                    </button>
+                    <button
+                      onClick={() => setReportSummaryPage((page) => Math.min(reportSummaryTotalPages, page + 1))}
+                      disabled={reportSummaryPage === reportSummaryTotalPages}
+                    >
+                      {'>'}
+                    </button>
+                    <button onClick={() => setReportSummaryPage(reportSummaryTotalPages)} disabled={reportSummaryPage === reportSummaryTotalPages}>
+                      {'>>'}
+                    </button>
+                  </div>
+                </div>
+              </section>
 
-              <div className="table-shell">
-                <table className="stock-table">
-                  <thead>
-                    <tr>
-                      <th>Модель картриджа</th>
-                      <th>На складе</th>
-                      <th>На заправке</th>
-                      <th>Установлено</th>
-                      <th>Списано</th>
-                      <th>Всего</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {stockSnapshotReport.byModel.map((row) => (
-                      <tr key={row.cartridgeModelId}>
-                        <td>{row.cartridgeModelName}</td>
-                        <td>{row.inStockQuantity}</td>
-                        <td>{row.onRefillQuantity}</td>
-                        <td>{row.installedQuantity}</td>
-                        <td>{row.writtenOffQuantity}</td>
-                        <td>{row.totalQuantity}</td>
+              <section className="form-card">
+                <h3>{reportItemsDataset.title}</h3>
+                <p className="form-help">Здесь можно быстро просмотреть детальные позиции по выбранному состоянию остатков.</p>
+                <div className="batch-selector-grid">
+                  {[
+                    { value: 'stock' as ReportItemsView, label: 'На складе', meta: `${stockSnapshotReport.inStockItems.length} позиций` },
+                    { value: 'reserve' as ReportItemsView, label: 'Резерв', meta: `${stockSnapshotReport.reserveItems.length} позиций` },
+                    { value: 'refill' as ReportItemsView, label: 'На заправке', meta: `${stockSnapshotReport.onRefillItems.length} позиций` },
+                    { value: 'writtenOff' as ReportItemsView, label: 'Списано', meta: `${stockSnapshotReport.writtenOffItems.length} позиций` },
+                  ].map((option) => (
+                    <button
+                      key={option.value}
+                      type="button"
+                      className={`batch-model-chip ${reportItemsView === option.value ? 'active' : ''}`}
+                      onClick={() => setReportItemsView(option.value)}
+                    >
+                      <span>{option.label}</span>
+                      <small>{option.meta}</small>
+                    </button>
+                  ))}
+                </div>
+                <div className="filters">
+                  <label>
+                    Поиск по позициям
+                    <input
+                      value={reportItemsSearchTerm}
+                      onChange={(e) => setReportItemsSearchTerm(e.target.value)}
+                      placeholder="Код, модель, отдел, кабинет"
+                    />
+                  </label>
+                </div>
+                <div className="table-shell">
+                  <table className="stock-table">
+                    <thead>
+                      <tr>
+                        <th>Код</th>
+                        <th>Модель</th>
+                        <th>Отдел</th>
+                        <th>Кабинет</th>
+                        <th>Количество</th>
+                        <th>Тип</th>
                       </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-
-              <div className="table-shell">
-                <table className="stock-table">
-                  <thead>
-                    <tr>
-                      <th>Кабинет</th>
-                      <th>На складе</th>
-                      <th>На заправке</th>
-                      <th>Установлено</th>
-                      <th>Списано</th>
-                      <th>Всего</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {stockSnapshotReport.byRoom.map((row) => (
-                      <tr key={`${row.roomId ?? 'none'}-${row.roomName}`}>
-                        <td>{row.roomName}</td>
-                        <td>{row.inStockQuantity}</td>
-                        <td>{row.onRefillQuantity}</td>
-                        <td>{row.installedQuantity}</td>
-                        <td>{row.writtenOffQuantity}</td>
-                        <td>{row.totalQuantity}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-
-              <div className="table-shell">
-                <table className="stock-table">
-                  <thead>
-                    <tr>
-                      <th>Тип картриджа</th>
-                      <th>На складе</th>
-                      <th>На заправке</th>
-                      <th>Установлено</th>
-                      <th>Списано</th>
-                      <th>Всего</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {stockSnapshotReport.byType.map((row) => (
-                      <tr key={row.cartridgeType}>
-                        <td>{row.cartridgeType}</td>
-                        <td>{row.inStockQuantity}</td>
-                        <td>{row.onRefillQuantity}</td>
-                        <td>{row.installedQuantity}</td>
-                        <td>{row.writtenOffQuantity}</td>
-                        <td>{row.totalQuantity}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
+                    </thead>
+                    <tbody>
+                      {paginatedReportItemRows.map((row) => (
+                        <tr key={row.key}>
+                          {row.cells.map((cell, index) => (
+                            <td key={`${row.key}-${index}`}>{cell}</td>
+                          ))}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                  {filteredReportItemRows.length === 0 && <div className="empty-state">По текущему поиску позиций не найдено.</div>}
+                </div>
+                <div className="pagination">
+                  <span>
+                    Позиций: {filteredReportItemRows.length} · Страница {reportItemsPage} / {reportItemsTotalPages}
+                  </span>
+                  <div className="pagination-controls">
+                    <button onClick={() => setReportItemsPage(1)} disabled={reportItemsPage === 1}>
+                      {'<<'}
+                    </button>
+                    <button onClick={() => setReportItemsPage((page) => Math.max(1, page - 1))} disabled={reportItemsPage === 1}>
+                      {'<'}
+                    </button>
+                    <button
+                      onClick={() => setReportItemsPage((page) => Math.min(reportItemsTotalPages, page + 1))}
+                      disabled={reportItemsPage === reportItemsTotalPages}
+                    >
+                      {'>'}
+                    </button>
+                    <button onClick={() => setReportItemsPage(reportItemsTotalPages)} disabled={reportItemsPage === reportItemsTotalPages}>
+                      {'>>'}
+                    </button>
+                  </div>
+                </div>
+              </section>
             </>
           )}
         </section>
       )}
 
-      {activeTab === 'users' && authUser?.permissions.canManageUsers && (
+      {activeTab === 'users' && canManageUsers && (
         <section className="departments-layout">
           <section className="panel departments-main-panel">
             <div className="section-heading">
@@ -3174,6 +5026,35 @@ export default function App() {
                 <p className="table-hint">Управление логинами, ролями и активностью учетных записей.</p>
               </div>
             </div>
+            <div className="filters">
+              <label>
+                Роль
+                <select value={userRoleFilter} onChange={(e) => setUserRoleFilter(e.target.value as UserRole | 'all')}>
+                  <option value="all">Все роли</option>
+                  {USER_ROLE_OPTIONS.map((roleOption) => (
+                    <option key={roleOption.value} value={roleOption.value}>
+                      {roleOption.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                Статус
+                <select value={userActiveFilter} onChange={(e) => setUserActiveFilter(e.target.value as 'all' | 'active' | 'inactive')}>
+                  <option value="all">Все</option>
+                  <option value="active">Активен</option>
+                  <option value="inactive">Отключен</option>
+                </select>
+              </label>
+              <label>
+                Поиск
+                <input
+                  value={userSearchTerm}
+                  onChange={(e) => setUserSearchTerm(e.target.value)}
+                  placeholder="Логин или ФИО"
+                />
+              </label>
+            </div>
             <div className="table-shell">
               <table className="stock-table">
                 <thead>
@@ -3181,16 +5062,28 @@ export default function App() {
                     <th>Логин</th>
                     <th>ФИО</th>
                     <th>Роль</th>
+                    <th>Права</th>
                     <th>Статус</th>
                     <th>Действия</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {users.map((user) => (
+                  {paginatedUsers.map((user) => (
                     <tr key={user.id}>
                       <td>{user.username}</td>
                       <td>{user.fullName}</td>
                       <td>{user.role}</td>
+                      <td>
+                        <div className="replacement-point-state">
+                          {user.permissions.canViewCatalog && <span>Каталог</span>}
+                          {user.permissions.canEditCatalog && <span>Редактирование</span>}
+                          {user.permissions.canOperate && <span>Операции</span>}
+                          {user.permissions.canViewLogs && <span>Логи</span>}
+                          {user.permissions.canExportReports && <span>Отчеты</span>}
+                          {user.permissions.canManageThresholds && <span>Пороги</span>}
+                          {user.permissions.canManageUsers && <span>Пользователи</span>}
+                        </div>
+                      </td>
                       <td>{user.active ? 'Активен' : 'Отключен'}</td>
                       <td>
                         <button type="button" className="ghost" onClick={() => beginUserEdit(user)}>
@@ -3201,7 +5094,29 @@ export default function App() {
                   ))}
                 </tbody>
               </table>
-              {users.length === 0 && <div className="empty-state">Пользователей пока нет.</div>}
+              {filteredUsers.length === 0 && <div className="empty-state">Пользователей по текущим фильтрам не найдено.</div>}
+            </div>
+            <div className="pagination">
+              <span>
+                Пользователей: {filteredUsers.length} · Страница {userPage} / {userTotalPages}
+              </span>
+              <div className="pagination-controls">
+                <button onClick={() => setUserPage(1)} disabled={userPage === 1}>
+                  {'<<'}
+                </button>
+                <button onClick={() => setUserPage((page) => Math.max(1, page - 1))} disabled={userPage === 1}>
+                  {'<'}
+                </button>
+                <button
+                  onClick={() => setUserPage((page) => Math.min(userTotalPages, page + 1))}
+                  disabled={userPage === userTotalPages}
+                >
+                  {'>'}
+                </button>
+                <button onClick={() => setUserPage(userTotalPages)} disabled={userPage === userTotalPages}>
+                  {'>>'}
+                </button>
+              </div>
             </div>
           </section>
 
@@ -3218,8 +5133,8 @@ export default function App() {
                 <input value={userFullName} onChange={(e) => setUserFullName(e.target.value)} />
               </label>
               <label>
-                Роль
-                <select value={userRole} onChange={(e) => setUserRole(e.target.value as UserRole)}>
+                Роль-шаблон
+                <select value={userRole} onChange={(e) => applyRolePreset(e.target.value as UserRole)}>
                   {USER_ROLE_OPTIONS.map((roleOption) => (
                     <option key={roleOption.value} value={roleOption.value}>
                       {roleOption.label}
@@ -3235,6 +5150,98 @@ export default function App() {
                 />
                 <span>Пользователь активен</span>
               </label>
+              <div className="side-card">
+                <p className="eyebrow">Permissions</p>
+                <h3>Индивидуальные права</h3>
+                <p className="table-muted">Роль выше только подставляет шаблон. Ниже можно вручную настроить доступы под конкретного пользователя.</p>
+
+                <div className="department-mini-list">
+                  <article className="department-mini-card">
+                    <strong>Каталог</strong>
+                    <label className="checkbox-line">
+                      <input
+                        type="checkbox"
+                        checked={userPermissions.canViewCatalog}
+                        onChange={(e) => updateUserPermission('canViewCatalog', e.target.checked)}
+                      />
+                      <span>Просмотр справочников и списков</span>
+                    </label>
+                    <label className="checkbox-line">
+                      <input
+                        type="checkbox"
+                        checked={userPermissions.canEditCatalog}
+                        onChange={(e) => updateUserPermission('canEditCatalog', e.target.checked)}
+                      />
+                      <span>Редактирование справочников</span>
+                    </label>
+                  </article>
+
+                  <article className="department-mini-card">
+                    <strong>Операции</strong>
+                    <label className="checkbox-line">
+                      <input
+                        type="checkbox"
+                        checked={userPermissions.canOperate}
+                        onChange={(e) => updateUserPermission('canOperate', e.target.checked)}
+                      />
+                      <span>Проведение операций</span>
+                    </label>
+                    <label className="checkbox-line">
+                      <input
+                        type="checkbox"
+                        checked={userPermissions.canManualDatetime}
+                        onChange={(e) => updateUserPermission('canManualDatetime', e.target.checked)}
+                      />
+                      <span>Ручной ввод даты и времени</span>
+                    </label>
+                  </article>
+
+                  <article className="department-mini-card">
+                    <strong>Аналитика</strong>
+                    <label className="checkbox-line">
+                      <input
+                        type="checkbox"
+                        checked={userPermissions.canViewLogs}
+                        onChange={(e) => updateUserPermission('canViewLogs', e.target.checked)}
+                      />
+                      <span>Просмотр журналов и аудита</span>
+                    </label>
+                    <label className="checkbox-line">
+                      <input
+                        type="checkbox"
+                        checked={userPermissions.canExportReports}
+                        onChange={(e) => updateUserPermission('canExportReports', e.target.checked)}
+                      />
+                      <span>Просмотр и экспорт отчетов</span>
+                    </label>
+                  </article>
+
+                  <article className="department-mini-card">
+                    <strong>Администрирование</strong>
+                    <label className="checkbox-line">
+                      <input
+                        type="checkbox"
+                        checked={userPermissions.canManageThresholds}
+                        onChange={(e) => updateUserPermission('canManageThresholds', e.target.checked)}
+                      />
+                      <span>Настройка уведомлений и порогов</span>
+                    </label>
+                    <label className="checkbox-line">
+                      <input
+                        type="checkbox"
+                        checked={userPermissions.canManageUsers}
+                        onChange={(e) => updateUserPermission('canManageUsers', e.target.checked)}
+                      />
+                      <span>Управление пользователями</span>
+                    </label>
+                  </article>
+
+                  <article className="department-mini-card">
+                    <strong>Следующие модули</strong>
+                    <p className="table-muted">Инвентаризация и заявки по залам позже можно расширить отдельными флагами, не ломая текущую модель прав.</p>
+                  </article>
+                </div>
+              </div>
               <label>
                 {editingUserId ? 'Новый пароль (опционально)' : 'Пароль'}
                 <input
@@ -3257,7 +5264,7 @@ export default function App() {
         </section>
       )}
 
-      {activeTab === 'create' && (
+      {activeTab === 'create' && canOperate && (
         <section className="panel">
           <div className="section-heading">
             <div>
@@ -3299,8 +5306,17 @@ export default function App() {
                   onChange={(e) => setModelMinimumQuantity(Number(e.target.value))}
                 />
               </label>
+              <label>
+                Совместимые модели принтеров
+                <textarea
+                  rows={4}
+                  value={modelCompatiblePrintersText}
+                  onChange={(e) => setModelCompatiblePrintersText(e.target.value)}
+                  placeholder={'HP LaserJet Pro M404\nHP LaserJet Pro M428'}
+                />
+              </label>
               <p className="form-help">
-                У модели задаются базовый тип и минимальный остаток. При пополнении тип теперь берется отсюда автоматически.
+                Укажите по одной модели принтера на строку. Это помогает хранить совместимость и потом расширять подбор расходников без переделки структуры.
               </p>
               <button type="submit">Создать модель</button>
             </form>
@@ -3352,6 +5368,16 @@ export default function App() {
                       </button>
                     </div>
                     <label>
+                      Куда положить
+                      <select
+                        value={batchTargetStatus}
+                        onChange={(e) => setBatchTargetStatus(e.target.value as CartridgeStatus)}
+                      >
+                        <option value="IN_STOCK">На склад</option>
+                        <option value="RESERVE">В резерв</option>
+                      </select>
+                    </label>
+                    <label>
                       Количество
                       <input
                         type="number"
@@ -3380,9 +5406,42 @@ export default function App() {
                 <p className="form-help">
                   Здесь можно менять минимальный остаток и тип модели. Удаление доступно только если модель не используется.
                 </p>
+                <div className="inline-filters">
+                  <label>
+                    Тип
+                    <select
+                      value={modelCatalogTypeFilter}
+                      onChange={(e) => setModelCatalogTypeFilter(e.target.value as ModelCatalogTypeFilter)}
+                    >
+                      <option value="all">Все</option>
+                      <option value="refillable">Заправляемые</option>
+                      <option value="disposable">Незаправляемые</option>
+                    </select>
+                  </label>
+                  <label>
+                    Баланс
+                    <select
+                      value={modelCatalogBalanceFilter}
+                      onChange={(e) => setModelCatalogBalanceFilter(e.target.value as ModelCatalogBalanceFilter)}
+                    >
+                      <option value="all">Любой</option>
+                      <option value="deficit">Дефицит</option>
+                      <option value="minimum">Ровно по минимуму</option>
+                      <option value="surplus">Излишек</option>
+                    </select>
+                  </label>
+                  <label>
+                    Поиск
+                    <input
+                      value={modelCatalogSearchTerm}
+                      onChange={(e) => setModelCatalogSearchTerm(e.target.value)}
+                      placeholder="Модель или совместимость"
+                    />
+                  </label>
+                </div>
                 <div className="model-catalog-grid">
-                  {models.length === 0 && <div className="empty-state">Моделей пока нет.</div>}
-                  {models.map((item) => (
+                  {filteredModelCatalogItems.length === 0 && <div className="empty-state">Моделей по текущим фильтрам не найдено.</div>}
+                  {paginatedModelCatalogItems.map((item) => (
                     <article key={item.id} className="model-catalog-card">
                       <div className="model-catalog-head">
                         <div>
@@ -3419,15 +5478,38 @@ export default function App() {
                             onChange={(e) => onChangeModelField(item.id, { minimumQuantity: Number(e.target.value) })}
                           />
                         </label>
+                        <label>
+                          Совместимые модели принтеров
+                          <textarea
+                            rows={4}
+                            value={modelCompatibilityDrafts[item.id] ?? formatCompatiblePrinterModels(item.compatiblePrinterModels)}
+                            onChange={(e) => {
+                              const nextValue = e.target.value
+                              setModelCompatibilityDrafts((current) => ({
+                                ...current,
+                                [item.id]: nextValue,
+                              }))
+                              onChangeModelField(item.id, { compatiblePrinterModels: parseCompatiblePrinterModels(nextValue) })
+                            }}
+                            placeholder={'HP LaserJet Pro M404\nHP LaserJet Pro M428'}
+                          />
+                        </label>
                       </div>
                       <div className="model-catalog-footer">
-                        <span className={balanceTone(modelSummaryById[item.id]?.balance ?? 0)}>
-                          {(modelSummaryById[item.id]?.balance ?? 0) < 0
-                            ? `Не хватает ${Math.abs(modelSummaryById[item.id]?.balance ?? 0)} шт.`
-                            : (modelSummaryById[item.id]?.balance ?? 0) === 0
-                              ? 'Ровно по минимуму'
-                              : `Излишек ${modelSummaryById[item.id]?.balance ?? 0} шт.`}
-                        </span>
+                        <div>
+                          <span className={balanceTone(modelSummaryById[item.id]?.balance ?? 0)}>
+                            {(modelSummaryById[item.id]?.balance ?? 0) < 0
+                              ? `Не хватает ${Math.abs(modelSummaryById[item.id]?.balance ?? 0)} шт.`
+                              : (modelSummaryById[item.id]?.balance ?? 0) === 0
+                                ? 'Ровно по минимуму'
+                                : `Излишек ${modelSummaryById[item.id]?.balance ?? 0} шт.`}
+                          </span>
+                          <p className="table-muted">
+                            {item.compatiblePrinterModels.length > 0
+                              ? `Совместимо: ${item.compatiblePrinterModels.join(', ')}`
+                              : 'Совместимые модели принтеров пока не указаны.'}
+                          </p>
+                        </div>
                       </div>
                       <div className="table-actions model-catalog-actions">
                         <button type="button" onClick={() => onSaveModelSettings(item)}>
@@ -3439,6 +5521,28 @@ export default function App() {
                       </div>
                     </article>
                   ))}
+                </div>
+                <div className="pagination compact-pagination">
+                  <span>
+                    Моделей: {filteredModelCatalogItems.length} · Страница {modelCatalogPage} / {modelCatalogTotalPages}
+                  </span>
+                  <div className="pagination-controls">
+                    <button onClick={() => setModelCatalogPage(1)} disabled={modelCatalogPage === 1}>
+                      {'<<'}
+                    </button>
+                    <button onClick={() => setModelCatalogPage((page) => Math.max(1, page - 1))} disabled={modelCatalogPage === 1}>
+                      {'<'}
+                    </button>
+                    <button
+                      onClick={() => setModelCatalogPage((page) => Math.min(modelCatalogTotalPages, page + 1))}
+                      disabled={modelCatalogPage === modelCatalogTotalPages}
+                    >
+                      {'>'}
+                    </button>
+                    <button onClick={() => setModelCatalogPage(modelCatalogTotalPages)} disabled={modelCatalogPage === modelCatalogTotalPages}>
+                      {'>>'}
+                    </button>
+                  </div>
                 </div>
               </section>
             </div>
@@ -3453,6 +5557,7 @@ export default function App() {
                       <strong>{item.name}</strong>
                       <p>Готово: {item.ready} · Пустых: {item.empty} · На заправке: {item.onRefill}</p>
                       <p>Минимум: {item.minimumQuantity} · Точек замены: {item.assignedPoints}</p>
+                      <p>{item.compatiblePrinterModels.length > 0 ? `Совместимо: ${item.compatiblePrinterModels.join(', ')}` : 'Совместимость не заполнена'}</p>
                       <span className={balanceTone(item.balance)}>
                         {item.balance < 0 ? `Не хватает ${Math.abs(item.balance)} шт.` : item.balance === 0 ? 'Ровно по минимуму' : `Излишек ${item.balance} шт.`}
                       </span>
@@ -3470,6 +5575,7 @@ export default function App() {
                       <strong>{item.name}</strong>
                       <p>Готово: {item.ready} · Пустых: {item.empty} · На заправке: {item.onRefill}</p>
                       <p>Минимум: {item.minimumQuantity} · Точек замены: {item.assignedPoints}</p>
+                      <p>{item.compatiblePrinterModels.length > 0 ? `Совместимо: ${item.compatiblePrinterModels.join(', ')}` : 'Совместимость не заполнена'}</p>
                       <span className={balanceTone(item.balance)}>
                         {item.balance < 0 ? `Не хватает ${Math.abs(item.balance)} шт.` : item.balance === 0 ? 'Ровно по минимуму' : `Излишек ${item.balance} шт.`}
                       </span>
@@ -3531,6 +5637,14 @@ export default function App() {
                   ))}
                 </select>
               </label>
+              <label>
+                Поиск
+                <input
+                  value={assetSearchTerm}
+                  onChange={(e) => setAssetSearchTerm(e.target.value)}
+                  placeholder="Инв. номер, актив, категория"
+                />
+              </label>
             </div>
             <div className="table-shell">
               <table className="stock-table">
@@ -3547,7 +5661,7 @@ export default function App() {
                   </tr>
                 </thead>
                 <tbody>
-                  {inventoryAssets.map((asset) => (
+                  {paginatedInventoryAssets.map((asset) => (
                     <tr key={asset.id}>
                       <td>{asset.inventoryCode}</td>
                       <td>{asset.name}</td>
@@ -3573,7 +5687,29 @@ export default function App() {
                   ))}
                 </tbody>
               </table>
-              {inventoryAssets.length === 0 && <div className="empty-state">Активов пока нет.</div>}
+              {filteredInventoryAssets.length === 0 && <div className="empty-state">Активов по текущим фильтрам не найдено.</div>}
+            </div>
+            <div className="pagination">
+              <span>
+                Активов: {filteredInventoryAssets.length} · Страница {assetPage} / {assetTotalPages}
+              </span>
+              <div className="pagination-controls">
+                <button onClick={() => setAssetPage(1)} disabled={assetPage === 1}>
+                  {'<<'}
+                </button>
+                <button onClick={() => setAssetPage((page) => Math.max(1, page - 1))} disabled={assetPage === 1}>
+                  {'<'}
+                </button>
+                <button
+                  onClick={() => setAssetPage((page) => Math.min(assetTotalPages, page + 1))}
+                  disabled={assetPage === assetTotalPages}
+                >
+                  {'>'}
+                </button>
+                <button onClick={() => setAssetPage(assetTotalPages)} disabled={assetPage === assetTotalPages}>
+                  {'>>'}
+                </button>
+              </div>
             </div>
           </section>
           <aside className="side-card">
@@ -3716,8 +5852,16 @@ export default function App() {
                   ))}
                 </select>
               </label>
+              <label>
+                Поиск по истории
+                <input
+                  value={movementSearchTerm}
+                  onChange={(e) => setMovementSearchTerm(e.target.value)}
+                  placeholder="Актив, маршрут, исполнитель"
+                />
+              </label>
               <div className="department-mini-list">
-                {inventoryMovements.slice(0, 12).map((movement) => (
+                {paginatedInventoryMovements.map((movement) => (
                   <article key={movement.id} className="department-mini-card">
                     <strong>{movement.assetInventoryCode} · {movement.assetName}</strong>
                     <p>{formatLocation(movement.fromDepartmentName, movement.fromRoomName)} {'->'} {formatLocation(movement.toDepartmentName, movement.toRoomName)}</p>
@@ -3725,7 +5869,29 @@ export default function App() {
                     <p>{movement.comment || 'Без комментария'}</p>
                   </article>
                 ))}
-                {inventoryMovements.length === 0 && <div className="empty-state">Перемещений пока нет.</div>}
+                {filteredInventoryMovements.length === 0 && <div className="empty-state">Перемещений по текущим фильтрам не найдено.</div>}
+              </div>
+              <div className="pagination compact-pagination">
+                <span>
+                  Перемещений: {filteredInventoryMovements.length} · Страница {movementPage} / {movementTotalPages}
+                </span>
+                <div className="pagination-controls">
+                  <button onClick={() => setMovementPage(1)} disabled={movementPage === 1}>
+                    {'<<'}
+                  </button>
+                  <button onClick={() => setMovementPage((page) => Math.max(1, page - 1))} disabled={movementPage === 1}>
+                    {'<'}
+                  </button>
+                  <button
+                    onClick={() => setMovementPage((page) => Math.min(movementTotalPages, page + 1))}
+                    disabled={movementPage === movementTotalPages}
+                  >
+                    {'>'}
+                  </button>
+                  <button onClick={() => setMovementPage(movementTotalPages)} disabled={movementPage === movementTotalPages}>
+                    {'>>'}
+                  </button>
+                </div>
               </div>
             </section>
           </aside>
@@ -3764,6 +5930,25 @@ export default function App() {
                   ))}
                 </select>
               </label>
+              <label>
+                Приоритет
+                <select value={hallPriorityFilter} onChange={(e) => setHallPriorityFilter(e.target.value as HallRequestPriority | '')}>
+                  <option value="">Все приоритеты</option>
+                  {HALL_REQUEST_PRIORITY_OPTIONS.map((priorityOption) => (
+                    <option key={priorityOption.value} value={priorityOption.value}>
+                      {priorityOption.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label>
+                Поиск
+                <input
+                  value={hallSearchTerm}
+                  onChange={(e) => setHallSearchTerm(e.target.value)}
+                  placeholder="Кабинет, заявитель, тема"
+                />
+              </label>
               <label className="checkbox-line">
                 <input
                   type="checkbox"
@@ -3792,7 +5977,7 @@ export default function App() {
                   </tr>
                 </thead>
                 <tbody>
-                  {hallRequests.map((request) => (
+                  {paginatedHallRequests.map((request) => (
                     <tr key={request.id}>
                       <td>{formatDateTime(request.requestedAt)}</td>
                       <td>{request.roomName}</td>
@@ -3820,7 +6005,29 @@ export default function App() {
                   ))}
                 </tbody>
               </table>
-              {hallRequests.length === 0 && <div className="empty-state">Заявок пока нет.</div>}
+              {filteredHallRequests.length === 0 && <div className="empty-state">Заявок по текущим фильтрам не найдено.</div>}
+            </div>
+            <div className="pagination">
+              <span>
+                Заявок: {filteredHallRequests.length} · Страница {hallPage} / {hallTotalPages}
+              </span>
+              <div className="pagination-controls">
+                <button onClick={() => setHallPage(1)} disabled={hallPage === 1}>
+                  {'<<'}
+                </button>
+                <button onClick={() => setHallPage((page) => Math.max(1, page - 1))} disabled={hallPage === 1}>
+                  {'<'}
+                </button>
+                <button
+                  onClick={() => setHallPage((page) => Math.min(hallTotalPages, page + 1))}
+                  disabled={hallPage === hallTotalPages}
+                >
+                  {'>'}
+                </button>
+                <button onClick={() => setHallPage(hallTotalPages)} disabled={hallPage === hallTotalPages}>
+                  {'>>'}
+                </button>
+              </div>
             </div>
           </section>
           <aside className="side-card">
@@ -4038,16 +6245,41 @@ export default function App() {
             <div className="detail-header">
               <div>
                 <p className="eyebrow">Подтверждение</p>
-                <h3>Удаление</h3>
-                <p className="table-hint">Удалить: {deleteTarget.label}</p>
+                <h3>{getDeleteDialogMeta(deleteTarget).title}</h3>
+                <p className="table-hint">{getDeleteDialogMeta(deleteTarget).subject}</p>
               </div>
             </div>
-            <p className="table-hint">Это действие нельзя отменить.</p>
+            <p className="table-hint">{getDeleteDialogMeta(deleteTarget).description}</p>
             <div className="detail-form-actions">
               <button type="button" className="danger-action" onClick={confirmDeleteTarget}>
-                Удалить
+                {getDeleteDialogMeta(deleteTarget).confirmLabel}
               </button>
               <button type="button" className="ghost" onClick={() => setDeleteTarget(null)}>
+                Отмена
+              </button>
+            </div>
+          </div>
+        </section>
+      )}
+
+      {writeOffRequest && (
+        <section className="detail-backdrop" onClick={() => setWriteOffRequest(null)}>
+          <div className="detail-panel confirm-panel danger-panel" onClick={(e) => e.stopPropagation()}>
+            <div className="detail-header">
+              <div>
+                <p className="eyebrow">Подтверждение</p>
+                <h3>Списание картриджа</h3>
+                <p className="table-hint">Списать: {writeOffRequest.label}</p>
+              </div>
+            </div>
+            <p className="table-hint">
+              Действие будет зафиксировано в журнале и переведёт остаток в статус списания.
+            </p>
+            <div className="detail-form-actions">
+              <button type="button" className="danger-action" onClick={confirmWriteOffRequest}>
+                Списать
+              </button>
+              <button type="button" className="ghost" onClick={() => setWriteOffRequest(null)}>
                 Отмена
               </button>
             </div>

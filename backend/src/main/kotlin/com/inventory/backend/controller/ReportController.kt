@@ -7,6 +7,7 @@ import org.springframework.format.annotation.DateTimeFormat
 import org.springframework.http.HttpHeaders
 import org.springframework.http.MediaType
 import org.springframework.http.ResponseEntity
+import org.springframework.security.access.prepost.PreAuthorize
 import org.springframework.web.bind.annotation.CrossOrigin
 import org.springframework.web.bind.annotation.GetMapping
 import org.springframework.web.bind.annotation.RequestMapping
@@ -17,12 +18,31 @@ import java.time.LocalDate
 @RestController
 @RequestMapping("/api/reports")
 @CrossOrigin
+@PreAuthorize("@authz.canExportReports()")
 class ReportController(
     private val reportService: ReportService,
 ) {
 
     @GetMapping("/stock-snapshot")
     fun getStockSnapshot(): StockSnapshotReportResponse = reportService.getStockSnapshotReport()
+
+    @GetMapping("/stock-snapshot.xlsx")
+    fun exportStockSnapshotXlsx(): ResponseEntity<ByteArray> {
+        val body = reportService.exportStockSnapshotXlsx()
+        return ResponseEntity.ok()
+            .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=stock-snapshot-report.xlsx")
+            .contentType(MediaType.parseMediaType("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"))
+            .body(body)
+    }
+
+    @GetMapping("/stock-snapshot.pdf")
+    fun exportStockSnapshotPdf(): ResponseEntity<ByteArray> {
+        val body = reportService.exportStockSnapshotPdf()
+        return ResponseEntity.ok()
+            .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=stock-snapshot-report.pdf")
+            .contentType(MediaType.APPLICATION_PDF)
+            .body(body)
+    }
 
     @GetMapping("/consumption")
     fun getConsumption(

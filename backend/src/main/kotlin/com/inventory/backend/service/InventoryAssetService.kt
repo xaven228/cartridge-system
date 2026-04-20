@@ -55,16 +55,16 @@ class InventoryAssetService(
 
         val (department, room) = resolveLocation(request.departmentId, request.roomId)
         val saved = inventoryAssetRepository.save(
-            InventoryAsset.builder()
-                .inventoryCode(normalizedCode)
-                .name(request.name.trim())
-                .category(request.category?.trim()?.ifBlank { null })
-                .department(department)
-                .room(room)
-                .status(request.status)
-                .quantity(request.quantity)
-                .comment(request.comment?.trim()?.ifBlank { null })
-                .build()
+            InventoryAsset().apply {
+                inventoryCode = normalizedCode
+                name = request.name.trim()
+                category = request.category?.trim()?.ifBlank { null }
+                this.department = department
+                this.room = room
+                status = request.status
+                quantity = request.quantity
+                comment = request.comment?.trim()?.ifBlank { null }
+            }
         )
 
         actionLogService.log(
@@ -157,16 +157,16 @@ class InventoryAssetService(
         val saved = inventoryAssetRepository.save(asset)
 
         val movement = inventoryAssetMovementRepository.save(
-            InventoryAssetMovement.builder()
-                .asset(saved)
-                .fromDepartment(fromDepartment)
-                .fromRoom(fromRoom)
-                .toDepartment(toDepartment)
-                .toRoom(toRoom)
-                .movedAt(request.movedAt ?: LocalDateTime.now())
-                .actor(request.actor?.trim()?.ifBlank { "Система" } ?: "Система")
-                .comment(request.comment?.trim()?.ifBlank { null })
-                .build()
+            InventoryAssetMovement().apply {
+                this.asset = saved
+                this.fromDepartment = fromDepartment
+                this.fromRoom = fromRoom
+                this.toDepartment = toDepartment
+                this.toRoom = toRoom
+                movedAt = request.movedAt ?: LocalDateTime.now()
+                actor = request.actor?.trim()?.ifBlank { "Система" } ?: "Система"
+                comment = request.comment?.trim()?.ifBlank { null }
+            }
         )
 
         actionLogService.log(
@@ -196,7 +196,7 @@ class InventoryAssetService(
     }
 
     private fun toResponse(asset: InventoryAsset): InventoryAssetResponse = InventoryAssetResponse(
-        id = asset.id,
+        id = asset.id!!,
         inventoryCode = asset.inventoryCode,
         name = asset.name,
         category = asset.category,
@@ -210,8 +210,8 @@ class InventoryAssetService(
     )
 
     private fun toMovementResponse(movement: InventoryAssetMovement): InventoryAssetMovementResponse = InventoryAssetMovementResponse(
-        id = movement.id,
-        assetId = movement.asset.id,
+        id = movement.id!!,
+        assetId = movement.asset.id!!,
         assetInventoryCode = movement.asset.inventoryCode,
         assetName = movement.asset.name,
         fromDepartmentId = movement.fromDepartment?.id,
@@ -222,7 +222,7 @@ class InventoryAssetService(
         toDepartmentName = movement.toDepartment?.name,
         toRoomId = movement.toRoom?.id,
         toRoomName = movement.toRoom?.name,
-        movedAt = movement.movedAt,
+        movedAt = movement.movedAt!!,
         actor = movement.actor,
         comment = movement.comment,
     )

@@ -41,13 +41,13 @@ class NotificationService(
         }
 
         val saved = notificationThresholdRepository.save(
-            NotificationThreshold.builder()
-                .cartridgeModel(model)
-                .department(department)
-                .minimumQuantity(request.minimumQuantity)
-                .active(request.active)
-                .comment(request.comment?.trim()?.ifBlank { null })
-                .build()
+            NotificationThreshold().apply {
+                cartridgeModel = model
+                this.department = department
+                minimumQuantity = request.minimumQuantity
+                active = request.active
+                comment = request.comment?.trim()?.ifBlank { null }
+            }
         )
 
         actionLogService.log(
@@ -112,20 +112,24 @@ class NotificationService(
         val departmentSpecific = mutableMapOf<Pair<Long, Long>, Int>()
 
         for (item in activeThresholds) {
-            val modelId = item.cartridgeModel.id
+            val modelId = item.cartridgeModel.id!!
             val department = item.department
             if (department == null) {
                 defaultByModel[modelId] = item.minimumQuantity
             } else {
-                departmentSpecific[modelId to department.id] = item.minimumQuantity
+                departmentSpecific[modelId to department.id!!] = item.minimumQuantity
             }
         }
 
-        val modelMinimums = cartridgeModelRepository.findAll().associate { it.id to (it.minimumQuantity ?: 0) }
+        val modelMinimums = cartridgeModelRepository.findAll().associate { it.id!! to it.minimumQuantity }
 
         val quantities = mutableMapOf<Pair<Long, Long>, Int>()
-        cartridgeRepository.findByStatusAndEmptyFalse(CartridgeStatus.IN_STOCK).forEach { cartridge ->
-            val key = cartridge.cartridgeModel.id to cartridge.department.id
+        cartridgeRepository.findAll()
+            .asSequence()
+            .filter { it.empty == false }
+            .filter { it.status == CartridgeStatus.IN_STOCK || it.status == CartridgeStatus.RESERVE }
+            .forEach { cartridge ->
+            val key = cartridge.cartridgeModel.id!! to cartridge.department.id!!
             quantities[key] = (quantities[key] ?: 0) + cartridge.quantity
         }
 
@@ -133,8 +137,8 @@ class NotificationService(
         candidateKeys.addAll(quantities.keys)
         candidateKeys.addAll(departmentSpecific.keys)
 
-        val modelNames = cartridgeModelRepository.findAll().associate { it.id to it.name }
-        val departmentNames = departmentRepository.findAll().associate { it.id to it.name }
+        val modelNames = cartridgeModelRepository.findAll().associate { it.id!! to it.name }
+        val departmentNames = departmentRepository.findAll().associate { it.id!! to it.name }
 
         return candidateKeys.mapNotNull { key ->
             val (modelId, departmentId) = key
@@ -183,8 +187,8 @@ class NotificationService(
     }
 
     private fun toThresholdResponse(entity: NotificationThreshold): NotificationThresholdResponse = NotificationThresholdResponse(
-        id = entity.id,
-        cartridgeModelId = entity.cartridgeModel.id,
+        id = entity.id!!,
+        cartridgeModelId = entity.cartridgeModel.id!!,
         cartridgeModelName = entity.cartridgeModel.name,
         departmentId = entity.department?.id,
         departmentName = entity.department?.name,

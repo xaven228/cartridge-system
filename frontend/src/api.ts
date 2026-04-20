@@ -1,4 +1,4 @@
-export type CartridgeStatus = 'IN_STOCK' | 'INSTALLED' | 'ON_REFILL' | 'WRITTEN_OFF'
+export type CartridgeStatus = 'IN_STOCK' | 'RESERVE' | 'INSTALLED' | 'ON_REFILL' | 'WRITTEN_OFF'
 
 export interface CurrentPrinterInstallation {
   cartridgeId: number
@@ -9,7 +9,10 @@ export interface CurrentPrinterInstallation {
   empty?: boolean | null
 }
 
-export type PrinterType = 'MONOCHROME' | 'COLOR'
+export type PrinterDeviceType = 'PRINTER' | 'MFP'
+export type PrinterColorMode = 'MONOCHROME' | 'COLOR'
+export type PrinterStatus = 'IN_OPERATION' | 'IN_STOCK' | 'IN_REPAIR' | 'WRITTEN_OFF'
+export type DepartmentStatus = 'ACTIVE' | 'DECOMMISSIONED'
 export type RoomStatus = 'ACTIVE' | 'DECOMMISSIONED'
 
 export interface PrinterSlot {
@@ -25,11 +28,19 @@ export interface PrinterSlot {
 export interface Printer {
   id?: number
   name: string
+  model?: string | null
+  ipAddress?: string | null
+  serialNumber?: string | null
   departmentId?: number | null
   departmentName?: string | null
   roomId?: number | null
   roomName?: string | null
-  printerType: PrinterType
+  deviceType: PrinterDeviceType
+  colorMode: PrinterColorMode
+  status: PrinterStatus
+  commissionedAt?: string | null
+  writtenOffAt?: string | null
+  comment?: string | null
   slots: PrinterSlot[]
 }
 
@@ -37,6 +48,7 @@ export interface Department {
   id: number
   name: string
   description?: string | null
+  status: DepartmentStatus
   printers?: Printer[]
 }
 
@@ -54,6 +66,7 @@ export interface CartridgeModel {
   name: string
   refillable: boolean
   minimumQuantity: number
+  compatiblePrinterModels: string[]
 }
 
 export interface Cartridge {
@@ -76,6 +89,7 @@ export interface Cartridge {
 export interface CreateDepartmentPayload {
   name: string
   description?: string
+  status: DepartmentStatus
 }
 
 export interface UpsertRoomPayload {
@@ -89,12 +103,14 @@ export interface CreateCartridgeModelPayload {
   name: string
   refillable: boolean
   minimumQuantity: number
+  compatiblePrinterModels: string[]
 }
 
 export interface UpdateCartridgeModelPayload {
   name: string
   refillable: boolean
   minimumQuantity: number
+  compatiblePrinterModels: string[]
 }
 
 export interface CreateCartridgePayload {
@@ -122,9 +138,15 @@ export interface RefillHistoryRecord {
 export interface ActionLogRecord {
   id: number
   actionType: string
+  entityType: string
+  result: string
   targetName: string
   details?: string | null
   actor?: string | null
+  deviceInfo?: string | null
+  oldValues?: string | null
+  newValues?: string | null
+  manualDateTime: boolean
   createdAt: string
 }
 
@@ -133,6 +155,8 @@ export interface ActionLogFilters {
   dateTo?: string
   actor?: string
   actionType?: string
+  entityType?: string
+  result?: string
   targetName?: string
 }
 
@@ -273,6 +297,7 @@ export interface UpsertUserPayload {
   password?: string
   role: UserRole
   active: boolean
+  permissions?: UserPermissions
 }
 
 export interface NotificationAlert {
@@ -331,6 +356,7 @@ export interface StockByDepartmentRow {
   departmentId: number
   departmentName: string
   inStockQuantity: number
+  reserveQuantity: number
   onRefillQuantity: number
   installedQuantity: number
   writtenOffQuantity: number
@@ -341,6 +367,7 @@ export interface StockByModelRow {
   cartridgeModelId: number
   cartridgeModelName: string
   inStockQuantity: number
+  reserveQuantity: number
   onRefillQuantity: number
   installedQuantity: number
   writtenOffQuantity: number
@@ -351,6 +378,7 @@ export interface StockByRoomRow {
   roomId?: number | null
   roomName: string
   inStockQuantity: number
+  reserveQuantity: number
   onRefillQuantity: number
   installedQuantity: number
   writtenOffQuantity: number
@@ -360,15 +388,37 @@ export interface StockByRoomRow {
 export interface StockByTypeRow {
   cartridgeType: string
   inStockQuantity: number
+  reserveQuantity: number
   onRefillQuantity: number
   installedQuantity: number
   writtenOffQuantity: number
   totalQuantity: number
 }
 
+export interface PrinterModelReportRow {
+  printerModelName: string
+  inOperationCount: number
+  inStockCount: number
+  inRepairCount: number
+  writtenOffCount: number
+  totalCount: number
+}
+
+export interface CartridgeStateRow {
+  cartridgeId: number
+  inventoryCode: string
+  cartridgeModelName: string
+  departmentName: string
+  roomName?: string | null
+  quantity: number
+  cartridgeType: string
+  status: string
+}
+
 export interface StockSnapshotReport {
   generatedAt: string
   totalInStock: number
+  totalReserve: number
   totalOnRefill: number
   totalInstalled: number
   totalWrittenOff: number
@@ -376,6 +426,11 @@ export interface StockSnapshotReport {
   byModel: StockByModelRow[]
   byRoom: StockByRoomRow[]
   byType: StockByTypeRow[]
+  byPrinterModel: PrinterModelReportRow[]
+  inStockItems: CartridgeStateRow[]
+  reserveItems: CartridgeStateRow[]
+  onRefillItems: CartridgeStateRow[]
+  writtenOffItems: CartridgeStateRow[]
 }
 
 export interface ReplaceCartridgePayload {
@@ -388,9 +443,17 @@ export interface ReplaceCartridgePayload {
 
 export interface UpsertPrinterPayload {
   name: string
+  model?: string
+  ipAddress?: string
+  serialNumber?: string
   departmentId: number
   roomId?: number
-  printerType: PrinterType
+  deviceType: PrinterDeviceType
+  colorMode: PrinterColorMode
+  status: PrinterStatus
+  commissionedAt?: string
+  writtenOffAt?: string
+  comment?: string
   slots: Array<{
     name: string
     cartridgeModelId: number
@@ -400,9 +463,14 @@ export interface UpsertPrinterPayload {
 const API_BASE =
   import.meta.env.VITE_API_BASE_URL ?? (import.meta.env.DEV ? 'http://localhost:8080' : '')
 let authToken = ''
+let unauthorizedHandler: (() => void) | null = null
 
 export function setAuthToken(token: string | null) {
   authToken = token?.trim() || ''
+}
+
+export function setUnauthorizedHandler(handler: (() => void) | null) {
+  unauthorizedHandler = handler
 }
 
 function extractErrorMessage(status: number, text: string): string {
@@ -442,6 +510,9 @@ async function fetchJson<T>(path: string, init?: RequestInit): Promise<T> {
   })
 
   if (!response.ok) {
+    if (response.status === 401 && unauthorizedHandler) {
+      unauthorizedHandler()
+    }
     const text = await response.text()
     throw new Error(extractErrorMessage(response.status, text))
   }
@@ -456,6 +527,9 @@ async function fetchBlob(path: string): Promise<Blob> {
   }
   const response = await fetch(`${API_BASE}${path}`, { headers })
   if (!response.ok) {
+    if (response.status === 401 && unauthorizedHandler) {
+      unauthorizedHandler()
+    }
     const text = await response.text()
     throw new Error(extractErrorMessage(response.status, text))
   }
@@ -582,6 +656,8 @@ export function getActionLogs(filters?: ActionLogFilters): Promise<ActionLogReco
   if (filters?.dateTo) params.set('dateTo', filters.dateTo)
   if (filters?.actor?.trim()) params.set('actor', filters.actor.trim())
   if (filters?.actionType?.trim()) params.set('actionType', filters.actionType.trim())
+  if (filters?.entityType?.trim()) params.set('entityType', filters.entityType.trim())
+  if (filters?.result?.trim()) params.set('result', filters.result.trim())
   if (filters?.targetName?.trim()) params.set('targetName', filters.targetName.trim())
   const query = params.toString()
   return fetchJson<ActionLogRecord[]>(`/api/action-logs${query ? `?${query}` : ''}`)
@@ -674,6 +750,12 @@ export function signIn(username: string, password: string): Promise<AuthResponse
   })
 }
 
+export function refreshAuthSession(): Promise<AuthResponse> {
+  return fetchJson<AuthResponse>('/api/auth/refresh', {
+    method: 'POST',
+  })
+}
+
 export function getCurrentUser(): Promise<AuthUser> {
   return fetchJson<AuthUser>('/api/auth/me')
 }
@@ -741,6 +823,14 @@ export function downloadConsumptionReportPdf(dateFrom: string, dateTo: string): 
 
 export function getStockSnapshotReport(): Promise<StockSnapshotReport> {
   return fetchJson<StockSnapshotReport>('/api/reports/stock-snapshot')
+}
+
+export function downloadStockSnapshotReportXlsx(): Promise<Blob> {
+  return fetchBlob('/api/reports/stock-snapshot.xlsx')
+}
+
+export function downloadStockSnapshotReportPdf(): Promise<Blob> {
+  return fetchBlob('/api/reports/stock-snapshot.pdf')
 }
 
 export function createCartridge(payload: CreateCartridgePayload): Promise<Cartridge> {

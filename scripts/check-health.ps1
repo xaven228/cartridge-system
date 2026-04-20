@@ -15,6 +15,8 @@ if (Test-Path (Join-Path $RootDir ".env")) {
 $AppPort = if ($env:APP_PORT) { $env:APP_PORT } else { "8080" }
 $PostgresHostPort = if ($env:POSTGRES_HOST_PORT) { $env:POSTGRES_HOST_PORT } else { "5433" }
 $FrontendPort = if ($env:FRONTEND_PORT) { $env:FRONTEND_PORT } else { "3000" }
+$HealthUsername = if ($env:APP_HEALTHCHECK_USERNAME) { $env:APP_HEALTHCHECK_USERNAME } else { "admin" }
+$HealthPassword = if ($env:APP_HEALTHCHECK_PASSWORD) { $env:APP_HEALTHCHECK_PASSWORD } else { "00000" }
 $Status = 0
 
 Write-Host "== Cartridge System Health Check =="
@@ -44,22 +46,44 @@ try {
 }
 
 Write-Host ""
-Write-Host "[3] API check"
+Write-Host "[3] API auth check"
 try {
-    $resp = Invoke-WebRequest -UseBasicParsing -Uri "http://localhost:$AppPort/api/departments" -TimeoutSec 5
-    if ($resp.StatusCode -eq 200) {
-        Write-Host "  OK: API responds on port $AppPort (HTTP 200)"
+    $loginBody = @{
+        username = $HealthUsername
+        password = $HealthPassword
+    } | ConvertTo-Json -Compress
+    $resp = Invoke-WebRequest -UseBasicParsing -Uri "http://localhost:$AppPort/api/auth/login" -Method Post -ContentType "application/json" -Body $loginBody -TimeoutSec 5
+    $loginJson = $resp.Content | ConvertFrom-Json
+    $token = $loginJson.token
+    if ($resp.StatusCode -eq 200 -and $token) {
+        Write-Host "  OK: login works on port $AppPort (HTTP 200)"
     } else {
-        Write-Host "  FAIL: API returned HTTP $($resp.StatusCode)"
+        Write-Host "  FAIL: login returned HTTP $($resp.StatusCode)"
         $Status = 1
     }
 } catch {
-    Write-Host "  FAIL: API check failed on port $AppPort"
+    Write-Host "  FAIL: login check failed on port $AppPort"
     $Status = 1
 }
 
 Write-Host ""
-Write-Host "[4] TCP ports"
+Write-Host "[4] Authenticated API check"
+try {
+    $headers = @{ Authorization = "Bearer $token" }
+    $resp = Invoke-WebRequest -UseBasicParsing -Uri "http://localhost:$AppPort/api/auth/me" -Headers $headers -TimeoutSec 5
+    if ($resp.StatusCode -eq 200) {
+        Write-Host "  OK: authenticated API responds on port $AppPort (HTTP 200)"
+    } else {
+        Write-Host "  FAIL: authenticated API returned HTTP $($resp.StatusCode)"
+        $Status = 1
+    }
+} catch {
+    Write-Host "  FAIL: authenticated API check failed on port $AppPort"
+    $Status = 1
+}
+
+Write-Host ""
+Write-Host "[5] TCP ports"
 try {
     $frontListen = Get-NetTCPConnection -State Listen -LocalPort ([int]$FrontendPort) -ErrorAction SilentlyContinue
     if ($frontListen) {
@@ -97,7 +121,7 @@ try {
 }
 
 Write-Host ""
-Write-Host "[5] Disk usage"
+Write-Host "[6] Disk usage"
 Get-PSDrive -PSProvider FileSystem | Select-Object Name, @{Name='UsedGB';Expression={[math]::Round(($_.Used/1GB),2)}}, @{Name='FreeGB';Expression={[math]::Round(($_.Free/1GB),2)}} | Out-Host
 
 Write-Host ""

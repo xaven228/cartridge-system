@@ -3,6 +3,7 @@ package com.inventory.backend.service
 import com.inventory.backend.dto.UpsertUserRequest
 import com.inventory.backend.dto.UserAdminResponse
 import com.inventory.backend.dto.UserPermissionsResponse
+import com.inventory.backend.entity.ActionLogType
 import com.inventory.backend.entity.AppUser
 import com.inventory.backend.exception.BadRequestException
 import com.inventory.backend.exception.ConflictException
@@ -16,6 +17,7 @@ import org.springframework.transaction.annotation.Transactional
 class UserAdminService(
     private val appUserRepository: AppUserRepository,
     private val passwordEncoder: PasswordEncoder,
+    private val actionLogService: ActionLogService,
 ) {
 
     @Transactional(readOnly = true)
@@ -34,16 +36,24 @@ class UserAdminService(
             throw BadRequestException("Для нового пользователя нужен пароль")
         }
 
-        val user = AppUser.builder()
-            .username(username)
-            .fullName(request.fullName.trim())
-            .passwordHash(passwordEncoder.encode(password))
-            .role(request.role)
-            .active(request.active)
-            .build()
+        val user = AppUser().apply {
+            this.username = username
+            fullName = request.fullName.trim()
+            passwordHash = passwordEncoder.encode(password)
+            role = request.role
+            active = request.active
+        }
 
         applyPermissions(user, request)
-        return toResponse(appUserRepository.save(user))
+        val saved = appUserRepository.save(user)
+        actionLogService.log(
+            actionType = ActionLogType.USER_CREATED,
+            targetName = saved.username,
+            details = "Создан пользователь ${saved.fullName}",
+            actor = "Система",
+            newValues = userAuditState(saved),
+        )
+        return toResponse(saved)
     }
 
     @Transactional
@@ -67,8 +77,18 @@ class UserAdminService(
             user.passwordHash = passwordEncoder.encode(password)
         }
 
+        val oldValues = userAuditState(user)
         applyPermissions(user, request)
-        return toResponse(appUserRepository.save(user))
+        val saved = appUserRepository.save(user)
+        actionLogService.log(
+            actionType = ActionLogType.USER_UPDATED,
+            targetName = saved.username,
+            details = "Обновлен пользователь ${saved.fullName}",
+            actor = "Система",
+            oldValues = oldValues,
+            newValues = userAuditState(saved),
+        )
+        return toResponse(saved)
     }
 
     private fun applyPermissions(user: AppUser, request: UpsertUserRequest) {
@@ -123,7 +143,7 @@ class UserAdminService(
     }
 
     private fun toResponse(user: AppUser): UserAdminResponse = UserAdminResponse(
-        id = user.id,
+        id = user.id!!,
         username = user.username,
         fullName = user.fullName,
         role = user.role,
@@ -139,4 +159,10 @@ class UserAdminService(
             canManualDatetime = user.canManualDatetime == true,
         ),
     )
+
+    private fun userAuditState(user: AppUser): String =
+        "username=${user.username}; fullName=${user.fullName}; role=${user.role}; active=${user.active}; " +
+            "view=${user.canViewCatalog}; edit=${user.canEditCatalog}; operate=${user.canOperate}; " +
+            "logs=${user.canViewLogs}; export=${user.canExportReports}; manageUsers=${user.canManageUsers}; " +
+            "thresholds=${user.canManageThresholds}; manualDatetime=${user.canManualDatetime}"
 }

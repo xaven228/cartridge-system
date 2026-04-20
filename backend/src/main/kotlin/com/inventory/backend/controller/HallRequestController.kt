@@ -5,6 +5,7 @@ import com.inventory.backend.dto.UpsertHallRequestRequest
 import com.inventory.backend.entity.HallRequestStatus
 import com.inventory.backend.service.HallRequestService
 import jakarta.validation.Valid
+import org.springframework.security.access.prepost.PreAuthorize
 import org.springframework.web.bind.annotation.CrossOrigin
 import org.springframework.web.bind.annotation.DeleteMapping
 import org.springframework.web.bind.annotation.GetMapping
@@ -24,6 +25,7 @@ class HallRequestController(
 ) {
 
     @GetMapping
+    @PreAuthorize("@authz.canViewCatalog()")
     fun getAll(
         @RequestParam(required = false) roomId: Long?,
         @RequestParam(required = false) status: HallRequestStatus?,
@@ -31,13 +33,16 @@ class HallRequestController(
     ): List<HallRequestResponse> = hallRequestService.getAll(roomId, status, overdue)
 
     @PostMapping
+    @PreAuthorize("@authz.canOperate()")
     fun create(@Valid @RequestBody request: UpsertHallRequestRequest): HallRequestResponse =
         hallRequestService.create(request)
 
     @PutMapping("/{id}")
+    @PreAuthorize("@authz.canOperate()")
     fun update(@PathVariable id: Long, @Valid @RequestBody request: UpsertHallRequestRequest): HallRequestResponse =
         hallRequestService.update(id, request)
 
     @DeleteMapping("/{id}")
+    @PreAuthorize("@authz.canOperate()")
     fun delete(@PathVariable id: Long) = hallRequestService.delete(id)
 }

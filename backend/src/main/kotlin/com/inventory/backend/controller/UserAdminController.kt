@@ -17,7 +17,7 @@ import org.springframework.web.bind.annotation.RestController
 @RestController
 @RequestMapping("/api/users")
 @CrossOrigin
-@PreAuthorize("hasRole('ADMIN')")
+@PreAuthorize("@authz.canManageUsers()")
 class UserAdminController(
     private val userAdminService: UserAdminService,
 ) {

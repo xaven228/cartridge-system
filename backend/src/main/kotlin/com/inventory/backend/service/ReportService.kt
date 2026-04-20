@@ -2,6 +2,8 @@ package com.inventory.backend.service
 
 import com.inventory.backend.dto.ConsumptionReportResponse
 import com.inventory.backend.dto.ConsumptionReportRowResponse
+import com.inventory.backend.dto.CartridgeStateRowResponse
+import com.inventory.backend.dto.PrinterModelReportRowResponse
 import com.inventory.backend.dto.StockByDepartmentRowResponse
 import com.inventory.backend.dto.StockByModelRowResponse
 import com.inventory.backend.dto.StockByRoomRowResponse
@@ -9,9 +11,11 @@ import com.inventory.backend.dto.StockByTypeRowResponse
 import com.inventory.backend.dto.StockSnapshotReportResponse
 import com.inventory.backend.entity.ActionLogType
 import com.inventory.backend.entity.CartridgeStatus
+import com.inventory.backend.entity.PrinterStatus
 import com.inventory.backend.repository.ActionLogRepository
 import com.inventory.backend.repository.CartridgeRepository
 import com.inventory.backend.repository.PrinterInstallationRepository
+import com.inventory.backend.repository.PrinterRepository
 import com.lowagie.text.Document
 import com.lowagie.text.Font
 import com.lowagie.text.Paragraph
@@ -31,6 +35,7 @@ class ReportService(
     private val actionLogRepository: ActionLogRepository,
     private val cartridgeRepository: CartridgeRepository,
     private val printerInstallationRepository: PrinterInstallationRepository,
+    private val printerRepository: PrinterRepository,
 ) {
 
     private val trackedTypes = setOf(
@@ -217,6 +222,171 @@ class ReportService(
         }
     }
 
+    fun exportStockSnapshotXlsx(): ByteArray {
+        val report = getStockSnapshotReport()
+        val workbook = XSSFWorkbook()
+
+        fun fillSheet(name: String, headers: List<String>, rows: List<List<String>>) {
+            val sheet = workbook.createSheet(name)
+            val headerRow = sheet.createRow(0)
+            headers.forEachIndexed { index, title -> headerRow.createCell(index).setCellValue(title) }
+            rows.forEachIndexed { rowIndex, row ->
+                val excelRow = sheet.createRow(rowIndex + 1)
+                row.forEachIndexed { cellIndex, value -> excelRow.createCell(cellIndex).setCellValue(value) }
+            }
+            headers.indices.forEach(sheet::autoSizeColumn)
+        }
+
+        fillSheet(
+            "Сводка",
+            listOf("Показатель", "Значение"),
+            listOf(
+                listOf("На складе", report.totalInStock.toString()),
+                listOf("В резерве", report.totalReserve.toString()),
+                listOf("На заправке", report.totalOnRefill.toString()),
+                listOf("Установлено", report.totalInstalled.toString()),
+                listOf("Списано", report.totalWrittenOff.toString()),
+            ),
+        )
+        fillSheet(
+            "По отделам",
+            listOf("Отдел", "На складе", "В резерве", "На заправке", "Установлено", "Списано", "Всего"),
+            report.byDepartment.map {
+                listOf(
+                    it.departmentName,
+                    it.inStockQuantity.toString(),
+                    it.reserveQuantity.toString(),
+                    it.onRefillQuantity.toString(),
+                    it.installedQuantity.toString(),
+                    it.writtenOffQuantity.toString(),
+                    it.totalQuantity.toString(),
+                )
+            },
+        )
+        fillSheet(
+            "По кабинетам",
+            listOf("Кабинет", "На складе", "В резерве", "На заправке", "Установлено", "Списано", "Всего"),
+            report.byRoom.map {
+                listOf(
+                    it.roomName,
+                    it.inStockQuantity.toString(),
+                    it.reserveQuantity.toString(),
+                    it.onRefillQuantity.toString(),
+                    it.installedQuantity.toString(),
+                    it.writtenOffQuantity.toString(),
+                    it.totalQuantity.toString(),
+                )
+            },
+        )
+        fillSheet(
+            "По типам",
+            listOf("Тип картриджа", "На складе", "В резерве", "На заправке", "Установлено", "Списано", "Всего"),
+            report.byType.map {
+                listOf(
+                    it.cartridgeType,
+                    it.inStockQuantity.toString(),
+                    it.reserveQuantity.toString(),
+                    it.onRefillQuantity.toString(),
+                    it.installedQuantity.toString(),
+                    it.writtenOffQuantity.toString(),
+                    it.totalQuantity.toString(),
+                )
+            },
+        )
+        fillSheet(
+            "Модели принтеров",
+            listOf("Модель принтера", "В эксплуатации", "На складе", "В ремонте", "Списано", "Всего"),
+            report.byPrinterModel.map {
+                listOf(
+                    it.printerModelName,
+                    it.inOperationCount.toString(),
+                    it.inStockCount.toString(),
+                    it.inRepairCount.toString(),
+                    it.writtenOffCount.toString(),
+                    it.totalCount.toString(),
+                )
+            },
+        )
+
+        fun stateRows(rows: List<CartridgeStateRowResponse>) = rows.map {
+            listOf(
+                it.inventoryCode,
+                it.cartridgeModelName,
+                it.departmentName,
+                it.roomName ?: "-",
+                it.quantity.toString(),
+                it.cartridgeType,
+                it.status,
+            )
+        }
+
+        fillSheet("Склад", listOf("Код", "Модель", "Отдел", "Кабинет", "Количество", "Тип", "Статус"), stateRows(report.inStockItems))
+        fillSheet("Резерв", listOf("Код", "Модель", "Отдел", "Кабинет", "Количество", "Тип", "Статус"), stateRows(report.reserveItems))
+        fillSheet("Заправка", listOf("Код", "Модель", "Отдел", "Кабинет", "Количество", "Тип", "Статус"), stateRows(report.onRefillItems))
+        fillSheet("Списанные", listOf("Код", "Модель", "Отдел", "Кабинет", "Количество", "Тип", "Статус"), stateRows(report.writtenOffItems))
+
+        ByteArrayOutputStream().use { output ->
+            workbook.use { it.write(output) }
+            return output.toByteArray()
+        }
+    }
+
+    fun exportStockSnapshotPdf(): ByteArray {
+        val report = getStockSnapshotReport()
+
+        ByteArrayOutputStream().use { output ->
+            val document = Document()
+            PdfWriter.getInstance(document, output)
+            document.open()
+
+            val titleFont = Font(Font.HELVETICA, 14f, Font.BOLD)
+            val bodyFont = Font(Font.HELVETICA, 9f)
+
+            document.add(Paragraph("Отчет по остаткам и состояниям картриджей", titleFont))
+            document.add(Paragraph("Сформирован: ${report.generatedAt}", bodyFont))
+            document.add(Paragraph("На складе: ${report.totalInStock}", bodyFont))
+            document.add(Paragraph("В резерве: ${report.totalReserve}", bodyFont))
+            document.add(Paragraph("На заправке: ${report.totalOnRefill}", bodyFont))
+            document.add(Paragraph("Установлено: ${report.totalInstalled}", bodyFont))
+            document.add(Paragraph("Списано: ${report.totalWrittenOff}", bodyFont))
+            document.add(Paragraph(" "))
+
+            val printerTable = PdfPTable(6)
+            printerTable.widthPercentage = 100f
+            listOf("Модель принтера", "Экспл.", "Склад", "Ремонт", "Списан", "Всего").forEach {
+                printerTable.addCell(PdfPCell(Phrase(it, bodyFont)))
+            }
+            report.byPrinterModel.forEach { row ->
+                printerTable.addCell(Phrase(row.printerModelName, bodyFont))
+                printerTable.addCell(Phrase(row.inOperationCount.toString(), bodyFont))
+                printerTable.addCell(Phrase(row.inStockCount.toString(), bodyFont))
+                printerTable.addCell(Phrase(row.inRepairCount.toString(), bodyFont))
+                printerTable.addCell(Phrase(row.writtenOffCount.toString(), bodyFont))
+                printerTable.addCell(Phrase(row.totalCount.toString(), bodyFont))
+            }
+            document.add(printerTable)
+            document.add(Paragraph(" "))
+
+            val departmentTable = PdfPTable(7)
+            departmentTable.widthPercentage = 100f
+            listOf("Отдел", "Склад", "Резерв", "Заправка", "Установлено", "Списано", "Всего").forEach {
+                departmentTable.addCell(PdfPCell(Phrase(it, bodyFont)))
+            }
+            report.byDepartment.forEach { row ->
+                departmentTable.addCell(Phrase(row.departmentName, bodyFont))
+                departmentTable.addCell(Phrase(row.inStockQuantity.toString(), bodyFont))
+                departmentTable.addCell(Phrase(row.reserveQuantity.toString(), bodyFont))
+                departmentTable.addCell(Phrase(row.onRefillQuantity.toString(), bodyFont))
+                departmentTable.addCell(Phrase(row.installedQuantity.toString(), bodyFont))
+                departmentTable.addCell(Phrase(row.writtenOffQuantity.toString(), bodyFont))
+                departmentTable.addCell(Phrase(row.totalQuantity.toString(), bodyFont))
+            }
+            document.add(departmentTable)
+            document.close()
+            return output.toByteArray()
+        }
+    }
+
     private fun extractQuantity(details: String?, fallback: Int): Int {
         if (details.isNullOrBlank()) {
             return fallback
@@ -227,26 +397,30 @@ class ReportService(
 
     fun getStockSnapshotReport(): StockSnapshotReportResponse {
         val cartridges = cartridgeRepository.findAll()
+        val printers = printerRepository.findAll()
         val installationsByCartridgeId = printerInstallationRepository.findAll()
             .groupBy { it.cartridge.id }
 
         data class Acc(
             var inStock: Int = 0,
+            var reserve: Int = 0,
             var onRefill: Int = 0,
             var installed: Int = 0,
             var writtenOff: Int = 0,
         ) {
-            fun total(): Int = inStock + onRefill + installed + writtenOff
+            fun total(): Int = inStock + reserve + onRefill + installed + writtenOff
         }
 
         val byDepartmentAcc = linkedMapOf<Pair<Long, String>, Acc>()
         val byModelAcc = linkedMapOf<Pair<Long, String>, Acc>()
         val byRoomAcc = linkedMapOf<Pair<Long?, String>, Acc>()
         val byTypeAcc = linkedMapOf<String, Acc>()
+        val printerModelAcc = linkedMapOf<String, MutableMap<PrinterStatus, Int>>()
 
         fun apply(acc: Acc, status: CartridgeStatus, quantity: Int) {
             when (status) {
                 CartridgeStatus.IN_STOCK -> acc.inStock += quantity
+                CartridgeStatus.RESERVE -> acc.reserve += quantity
                 CartridgeStatus.ON_REFILL -> acc.onRefill += quantity
                 CartridgeStatus.INSTALLED -> acc.installed += quantity
                 CartridgeStatus.WRITTEN_OFF -> acc.writtenOff += quantity
@@ -254,8 +428,8 @@ class ReportService(
         }
 
         cartridges.forEach { c ->
-            val departmentKey = c.department.id to c.department.name
-            val modelKey = c.cartridgeModel.id to c.cartridgeModel.name
+            val departmentKey = c.department.id!! to c.department.name
+            val modelKey = c.cartridgeModel.id!! to c.cartridgeModel.name
             val typeKey = if (c.refillable == true) "Заправляемые" else "Незаправляемые"
             val departmentAcc = byDepartmentAcc.getOrPut(departmentKey) { Acc() }
             val modelAcc = byModelAcc.getOrPut(modelKey) { Acc() }
@@ -291,12 +465,19 @@ class ReportService(
             }
         }
 
+        printers.forEach { printer ->
+            val modelName = printer.model?.takeIf { it.isNotBlank() } ?: printer.name
+            val acc = printerModelAcc.getOrPut(modelName) { mutableMapOf() }
+            acc[printer.status] = (acc[printer.status] ?: 0) + 1
+        }
+
         val byDepartment = byDepartmentAcc.entries
             .map { (key, acc) ->
                 StockByDepartmentRowResponse(
                     departmentId = key.first,
                     departmentName = key.second,
                     inStockQuantity = acc.inStock,
+                    reserveQuantity = acc.reserve,
                     onRefillQuantity = acc.onRefill,
                     installedQuantity = acc.installed,
                     writtenOffQuantity = acc.writtenOff,
@@ -311,6 +492,7 @@ class ReportService(
                     cartridgeModelId = key.first,
                     cartridgeModelName = key.second,
                     inStockQuantity = acc.inStock,
+                    reserveQuantity = acc.reserve,
                     onRefillQuantity = acc.onRefill,
                     installedQuantity = acc.installed,
                     writtenOffQuantity = acc.writtenOff,
@@ -325,6 +507,7 @@ class ReportService(
                     roomId = key.first,
                     roomName = key.second,
                     inStockQuantity = acc.inStock,
+                    reserveQuantity = acc.reserve,
                     onRefillQuantity = acc.onRefill,
                     installedQuantity = acc.installed,
                     writtenOffQuantity = acc.writtenOff,
@@ -338,6 +521,7 @@ class ReportService(
                 StockByTypeRowResponse(
                     cartridgeType = typeName,
                     inStockQuantity = acc.inStock,
+                    reserveQuantity = acc.reserve,
                     onRefillQuantity = acc.onRefill,
                     installedQuantity = acc.installed,
                     writtenOffQuantity = acc.writtenOff,
@@ -346,9 +530,48 @@ class ReportService(
             }
             .sortedBy { it.cartridgeType }
 
+        val byPrinterModel = printerModelAcc.entries.map { (modelName, counts) ->
+            val inOperation = counts[PrinterStatus.IN_OPERATION] ?: 0
+            val inStock = counts[PrinterStatus.IN_STOCK] ?: 0
+            val inRepair = counts[PrinterStatus.IN_REPAIR] ?: 0
+            val writtenOff = counts[PrinterStatus.WRITTEN_OFF] ?: 0
+            PrinterModelReportRowResponse(
+                printerModelName = modelName,
+                inOperationCount = inOperation,
+                inStockCount = inStock,
+                inRepairCount = inRepair,
+                writtenOffCount = writtenOff,
+                totalCount = inOperation + inStock + inRepair + writtenOff,
+            )
+        }.sortedWith(compareByDescending<PrinterModelReportRowResponse> { it.totalCount }.thenBy { it.printerModelName })
+
+        fun toStateRow(cartridge: com.inventory.backend.entity.Cartridge): CartridgeStateRowResponse {
+            val roomName = if (cartridge.status == CartridgeStatus.INSTALLED) {
+                installationsByCartridgeId[cartridge.id].orEmpty().firstOrNull()?.printerSlot?.printer?.room?.name
+            } else {
+                null
+            }
+            return CartridgeStateRowResponse(
+                cartridgeId = cartridge.id!!,
+                inventoryCode = cartridge.inventoryCode,
+                cartridgeModelName = cartridge.cartridgeModel.name,
+                departmentName = cartridge.department.name,
+                roomName = roomName,
+                quantity = cartridge.quantity,
+                cartridgeType = if (cartridge.refillable == true) "Заправляемый" else "Незаправляемый",
+                status = cartridge.status.name,
+            )
+        }
+
+        val inStockItems = cartridges.filter { it.status == CartridgeStatus.IN_STOCK }.sortedBy { it.cartridgeModel.name }.map(::toStateRow)
+        val reserveItems = cartridges.filter { it.status == CartridgeStatus.RESERVE }.sortedBy { it.cartridgeModel.name }.map(::toStateRow)
+        val onRefillItems = cartridges.filter { it.status == CartridgeStatus.ON_REFILL }.sortedBy { it.cartridgeModel.name }.map(::toStateRow)
+        val writtenOffItems = cartridges.filter { it.status == CartridgeStatus.WRITTEN_OFF }.sortedBy { it.cartridgeModel.name }.map(::toStateRow)
+
         return StockSnapshotReportResponse(
             generatedAt = LocalDateTime.now().toString(),
             totalInStock = byDepartment.sumOf { it.inStockQuantity },
+            totalReserve = byDepartment.sumOf { it.reserveQuantity },
             totalOnRefill = byDepartment.sumOf { it.onRefillQuantity },
             totalInstalled = byDepartment.sumOf { it.installedQuantity },
             totalWrittenOff = byDepartment.sumOf { it.writtenOffQuantity },
@@ -356,6 +579,11 @@ class ReportService(
             byModel = byModel,
             byRoom = byRoom,
             byType = byType,
+            byPrinterModel = byPrinterModel,
+            inStockItems = inStockItems,
+            reserveItems = reserveItems,
+            onRefillItems = onRefillItems,
+            writtenOffItems = writtenOffItems,
         )
     }
 }

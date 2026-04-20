@@ -52,17 +52,17 @@ class HallRequestService(
         val room = roomRepository.findById(request.roomId)
             .orElseThrow { NotFoundException("Кабинет не найден: ${request.roomId}") }
 
-        val hallRequest = HallRequest.builder()
-            .room(room)
-            .requesterName(request.requesterName.trim())
-            .title(request.title.trim())
-            .description(request.description?.trim()?.ifBlank { null })
-            .priority(request.priority)
-            .status(request.status)
-            .requestedAt(LocalDateTime.now())
-            .plannedAt(request.plannedAt)
-            .completedAt(if (request.status == HallRequestStatus.DONE) LocalDateTime.now() else null)
-            .build()
+        val hallRequest = HallRequest().apply {
+            this.room = room
+            requesterName = request.requesterName.trim()
+            title = request.title.trim()
+            description = request.description?.trim()?.ifBlank { null }
+            priority = request.priority
+            status = request.status
+            requestedAt = LocalDateTime.now()
+            plannedAt = request.plannedAt
+            completedAt = if (request.status == HallRequestStatus.DONE) LocalDateTime.now() else null
+        }
 
         val saved = hallRequestRepository.save(hallRequest)
         actionLogService.log(
@@ -147,10 +147,10 @@ class HallRequestService(
     }
 
     private fun toResponse(request: HallRequest): HallRequestResponse = HallRequestResponse(
-        id = request.id,
-        roomId = request.room.id,
+        id = request.id!!,
+        roomId = request.room.id!!,
         roomName = request.room.name,
-        departmentId = request.room.department.id,
+        departmentId = request.room.department.id!!,
         departmentName = request.room.department.name,
         requesterName = request.requesterName,
         title = request.title,

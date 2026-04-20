@@ -3,7 +3,10 @@ package com.inventory.backend.service
 import com.inventory.backend.dto.RoomResponse
 import com.inventory.backend.dto.UpsertRoomRequest
 import com.inventory.backend.entity.ActionLogType
+import com.inventory.backend.entity.DepartmentStatus
+import com.inventory.backend.entity.PrinterStatus
 import com.inventory.backend.entity.Room
+import com.inventory.backend.entity.RoomStatus
 import com.inventory.backend.exception.BadRequestException
 import com.inventory.backend.exception.ConflictException
 import com.inventory.backend.exception.NotFoundException
@@ -35,6 +38,7 @@ class RoomService(
     fun create(request: UpsertRoomRequest): RoomResponse {
         val department = departmentRepository.findById(request.departmentId)
             .orElseThrow { NotFoundException("Отдел не найден: ${request.departmentId}") }
+        validateDepartmentForRoomChange(department.status, false)
 
         val normalizedName = request.name.trim()
         if (roomRepository.existsByDepartmentIdAndNameIgnoreCase(request.departmentId, normalizedName)) {
@@ -42,12 +46,12 @@ class RoomService(
         }
 
         val saved = roomRepository.save(
-            Room.builder()
-                .name(normalizedName)
-                .department(department)
-                .status(request.status)
-                .comment(request.comment?.trim()?.ifBlank { null })
-                .build()
+            Room().apply {
+                name = normalizedName
+                this.department = department
+                status = request.status
+                comment = request.comment?.trim()?.ifBlank { null }
+            }
         )
 
         actionLogService.log(
@@ -67,6 +71,7 @@ class RoomService(
 
         val department = departmentRepository.findById(request.departmentId)
             .orElseThrow { NotFoundException("Отдел не найден: ${request.departmentId}") }
+        validateDepartmentForRoomChange(department.status, room.department.id == department.id)
 
         val normalizedName = request.name.trim()
         if (roomRepository.existsByDepartmentIdAndNameIgnoreCaseAndIdNot(request.departmentId, normalizedName, id)) {
@@ -95,26 +100,37 @@ class RoomService(
         val room = roomRepository.findById(id)
             .orElseThrow { NotFoundException("Кабинет не найден: $id") }
 
-        if (printerRepository.existsByRoomId(id)) {
-            throw BadRequestException("Нельзя удалить кабинет, пока к нему привязаны принтеры")
+        if (room.status == RoomStatus.DECOMMISSIONED) {
+            return
+        }
+        if (printerRepository.existsByRoomIdAndStatusNot(id, PrinterStatus.WRITTEN_OFF)) {
+            throw BadRequestException("Нельзя вывести кабинет из использования, пока к нему привязаны активные принтеры")
         }
 
+        room.status = RoomStatus.DECOMMISSIONED
+        val saved = roomRepository.save(room)
+
         actionLogService.log(
-            ActionLogType.ROOM_DELETED,
-            room.name,
-            "Кабинет удален",
+            ActionLogType.ROOM_DECOMMISSIONED,
+            saved.name,
+            "Кабинет переведен в статус DECOMMISSIONED",
             "Система"
         )
-
-        roomRepository.delete(room)
     }
 
     fun toResponse(room: Room): RoomResponse = RoomResponse(
-        id = room.id,
+        id = room.id!!,
         name = room.name,
-        departmentId = room.department.id,
+        departmentId = room.department.id!!,
         departmentName = room.department.name,
         status = room.status,
         comment = room.comment,
     )
+
+    private fun validateDepartmentForRoomChange(status: DepartmentStatus, isCurrentDepartment: Boolean) {
+        if (status == DepartmentStatus.ACTIVE || isCurrentDepartment) {
+            return
+        }
+        throw BadRequestException("Нельзя привязать кабинет к отделу, который выведен из использования")
+    }
 }
