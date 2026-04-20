@@ -1,0 +1,129 @@
+package com.inventory.backend.entity
+
+enum class ActionLogType {
+    USER_LOGIN,
+    USER_CREATED,
+    USER_UPDATED,
+    CARTRIDGE_CREATED,
+    CARTRIDGE_QUANTITY_CHANGED,
+    CARTRIDGE_INSTALLED,
+    CARTRIDGE_REMOVED,
+    CARTRIDGE_SENT_TO_REFILL,
+    CARTRIDGE_RETURNED_FROM_REFILL,
+    CARTRIDGE_WRITTEN_OFF,
+    CARTRIDGE_MARKED_EMPTY,
+    CARTRIDGE_REFILLABLE_CHANGED,
+    CARTRIDGE_DELETED,
+    DEPARTMENT_CREATED,
+    DEPARTMENT_UPDATED,
+    DEPARTMENT_DELETED,
+    DEPARTMENT_DECOMMISSIONED,
+    ROOM_CREATED,
+    ROOM_UPDATED,
+    ROOM_DELETED,
+    ROOM_DECOMMISSIONED,
+    PRINTER_CREATED,
+    PRINTER_UPDATED,
+    PRINTER_WRITTEN_OFF,
+    THRESHOLD_CREATED,
+    THRESHOLD_UPDATED,
+    THRESHOLD_DELETED,
+    INVENTORY_ASSET_CREATED,
+    INVENTORY_ASSET_UPDATED,
+    INVENTORY_ASSET_DELETED,
+    INVENTORY_ASSET_TRANSFERRED,
+    HALL_REQUEST_CREATED,
+    HALL_REQUEST_UPDATED,
+    HALL_REQUEST_DELETED,
+    HALL_REQUEST_ESCALATED,
+    CARTRIDGE_MODEL_CREATED,
+    CARTRIDGE_MODEL_DELETED,
+}
+
+enum class ActionLogEntityType {
+    AUTH,
+    USER,
+    DEPARTMENT,
+    ROOM,
+    PRINTER,
+    CARTRIDGE,
+    CARTRIDGE_MODEL,
+    NOTIFICATION_THRESHOLD,
+    INVENTORY_ASSET,
+    HALL_REQUEST,
+    SYSTEM,
+}
+
+enum class ActionLogResult {
+    SUCCESS,
+    FAILED,
+}
+
+enum class DepartmentStatus {
+    ACTIVE,
+    DECOMMISSIONED,
+}
+
+enum class CartridgeStatus {
+    IN_STOCK,
+    RESERVE,
+    INSTALLED,
+    ON_REFILL,
+    WRITTEN_OFF,
+}
+
+enum class HallRequestPriority {
+    LOW,
+    MEDIUM,
+    HIGH,
+    URGENT,
+}
+
+enum class HallRequestStatus {
+    OPEN,
+    IN_PROGRESS,
+    DONE,
+    CANCELLED,
+}
+
+enum class InventoryAssetStatus {
+    IN_USE,
+    IN_STOCK,
+    IN_REPAIR,
+    WRITTEN_OFF,
+}
+
+enum class PrinterDeviceType {
+    PRINTER,
+    MFP,
+}
+
+enum class PrinterColorMode {
+    MONOCHROME,
+    COLOR,
+}
+
+enum class PrinterStatus {
+    IN_OPERATION,
+    IN_STOCK,
+    IN_REPAIR,
+    WRITTEN_OFF,
+}
+
+enum class RefillStatus {
+    SENT,
+    RETURNED,
+    FAILED,
+    WRITTEN_OFF,
+}
+
+enum class RoomStatus {
+    ACTIVE,
+    DECOMMISSIONED,
+}
+
+enum class UserRole {
+    ADMIN,
+    OPERATOR,
+    VIEWER,
+}

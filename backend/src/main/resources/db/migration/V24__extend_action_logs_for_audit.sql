@@ -1,0 +1,10 @@
+ALTER TABLE action_logs
+    ADD COLUMN IF NOT EXISTS entity_type VARCHAR(64) NOT NULL DEFAULT 'SYSTEM',
+    ADD COLUMN IF NOT EXISTS result VARCHAR(32) NOT NULL DEFAULT 'SUCCESS',
+    ADD COLUMN IF NOT EXISTS device_info VARCHAR(1000),
+    ADD COLUMN IF NOT EXISTS old_values VARCHAR(4000),
+    ADD COLUMN IF NOT EXISTS new_values VARCHAR(4000),
+    ADD COLUMN IF NOT EXISTS manual_datetime BOOLEAN NOT NULL DEFAULT FALSE;
+
+CREATE INDEX IF NOT EXISTS idx_action_logs_entity_type ON action_logs (entity_type);
+CREATE INDEX IF NOT EXISTS idx_action_logs_result ON action_logs (result);
